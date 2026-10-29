@@ -1,0 +1,14146 @@
+// src/grid.js
+var HDR_RANGE = 1.8;
+var HDR = 255 / HDR_RANGE;
+var Grid = class {
+  constructor() {
+    this.cols = 0;
+    this.rows = 0;
+  }
+  resize(cols, rows) {
+    this.cols = cols;
+    this.rows = rows;
+    const n = cols * rows;
+    this.ch = new Uint8Array(n);
+    this.fg = new Float32Array(n * 3);
+    this.bg = new Float32Array(n * 3);
+    this.glow = new Float32Array(n);
+    this.depth = new Float32Array(n);
+    this.kind = new Uint8Array(n);
+    this.tex0 = new Uint8ClampedArray(n * 4);
+    this.tex1 = new Uint8ClampedArray(n * 4);
+    this.clear();
+  }
+  clear() {
+    this.ch.fill(32);
+    this.fg.fill(0);
+    this.bg.fill(0);
+    this.glow.fill(0);
+    this.depth.fill(Infinity);
+    this.kind.fill(0);
+  }
+  set(x, y, ch, fr, fg, fb, br, bg, bb, glow = 0) {
+    if (x < 0 || y < 0 || x >= this.cols || y >= this.rows) return;
+    const i = y * this.cols + x, k = i * 3;
+    this.ch[i] = ch;
+    this.fg[k] = fr;
+    this.fg[k + 1] = fg;
+    this.fg[k + 2] = fb;
+    this.bg[k] = br;
+    this.bg[k + 1] = bg;
+    this.bg[k + 2] = bb;
+    this.glow[i] = glow;
+  }
+  // Overwrite only the glyph + foreground, keeping what is behind.
+  glyph(x, y, ch, r, g, b, glow = 0) {
+    if (x < 0 || y < 0 || x >= this.cols || y >= this.rows) return;
+    const i = y * this.cols + x, k = i * 3;
+    this.ch[i] = ch;
+    this.fg[k] = r;
+    this.fg[k + 1] = g;
+    this.fg[k + 2] = b;
+    if (glow > this.glow[i]) this.glow[i] = glow;
+  }
+  // Darken/tint the background of a rectangle (HUD panels).
+  shade(x, y, w, h, r, g, b, a) {
+    for (let yy = Math.max(0, y); yy < Math.min(this.rows, y + h); yy++) {
+      for (let xx = Math.max(0, x); xx < Math.min(this.cols, x + w); xx++) {
+        const i = yy * this.cols + xx, k = i * 3;
+        this.bg[k] += (r - this.bg[k]) * a;
+        this.bg[k + 1] += (g - this.bg[k + 1]) * a;
+        this.bg[k + 2] += (b - this.bg[k + 2]) * a;
+        this.fg[k] += (r - this.fg[k]) * a;
+        this.fg[k + 1] += (g - this.fg[k + 1]) * a;
+        this.fg[k + 2] += (b - this.fg[k + 2]) * a;
+        this.glow[i] *= 1 - a;
+      }
+    }
+  }
+  text(x, y, s, r, g, b, glow = 0) {
+    r *= 1.25;
+    g *= 1.25;
+    b *= 1.25;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c !== 32) this.glyph(x + i, y, c < 32 || c > 126 ? 63 : c, r, g, b, glow);
+      else if (x + i >= 0 && x + i < this.cols && y >= 0 && y < this.rows) this.ch[y * this.cols + x + i] = 32;
+    }
+  }
+  pack() {
+    const n = this.cols * this.rows;
+    const { ch, fg, bg, glow, tex0, tex1 } = this;
+    for (let i = 0, j = 0, k = 0; i < n; i++, j += 4, k += 3) {
+      tex0[j] = fg[k] * HDR;
+      tex0[j + 1] = fg[k + 1] * HDR;
+      tex0[j + 2] = fg[k + 2] * HDR;
+      tex0[j + 3] = ch[i] - 32;
+      tex1[j] = bg[k] * HDR;
+      tex1[j + 1] = bg[k + 1] * HDR;
+      tex1[j + 2] = bg[k + 2] * HDR;
+      tex1[j + 3] = glow[i] * 255;
+    }
+  }
+};
+
+// src/gl.js
+var VS = `#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+var FS_GRID = `#version 300 es
+precision highp float; precision highp int;
+uniform sampler2D uT0; uniform sampler2D uT1; uniform sampler2D uAtlas;
+uniform sampler2D uB1; uniform sampler2D uB2;
+uniform vec2 uOrigin; uniform vec2 uCell; uniform ivec2 uGrid;
+uniform float uCanvasH; uniform float uScale; uniform int uMode;
+uniform float uBloom; uniform float uVig; uniform float uExposure; uniform float uRange; uniform float uSat;
+in vec2 vUv; out vec4 o;
+void main(){
+  vec2 px = vec2(gl_FragCoord.x * uScale, uCanvasH - gl_FragCoord.y * uScale);
+  vec2 g = (px - uOrigin) / uCell;
+  ivec2 c = ivec2(floor(g));
+  vec3 col = vec3(0.0); float glow = 0.0;
+  if (c.x >= 0 && c.y >= 0 && c.x < uGrid.x && c.y < uGrid.y) {
+    vec4 a = texelFetch(uT0, c, 0);
+    vec4 b = texelFetch(uT1, c, 0);
+    int gi = int(a.a * 255.0 + 0.5);
+    ivec2 lp = ivec2(px - uOrigin) - c * ivec2(uCell);
+    ivec2 ap = ivec2(gi % 16, gi / 16) * ivec2(uCell) + lp;
+    float k = texelFetch(uAtlas, ap, 0).a;
+    col = mix(b.rgb, a.rgb, k) * uRange;
+    glow = b.a;
+  }
+  if (uMode == 1) { o = vec4(col * glow * 1.6, 1.0); return; }
+  vec3 bl = texture(uB1, vUv).rgb * 0.8 + texture(uB2, vUv).rgb * 1.3;
+  col = col + bl * uBloom;
+  col = 1.0 - exp(-col * uExposure);
+  float lm = dot(col, vec3(0.299, 0.587, 0.114));
+  col = clamp(mix(vec3(lm), col, uSat), 0.0, 1.0);
+  vec2 q = vUv - 0.5;
+  col *= 1.0 - uVig * dot(q, q) * 1.5;
+  o = vec4(col, 1.0);
+}`;
+var FS_BLUR = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc; uniform vec2 uDir;
+in vec2 vUv; out vec4 o;
+void main(){
+  vec3 s = texture(uSrc, vUv).rgb * 0.2270270;
+  s += (texture(uSrc, vUv + uDir * 1.3846153).rgb + texture(uSrc, vUv - uDir * 1.3846153).rgb) * 0.3162162;
+  s += (texture(uSrc, vUv + uDir * 3.2307692).rgb + texture(uSrc, vUv - uDir * 3.2307692).rgb) * 0.0702702;
+  o = vec4(s, 1.0);
+}`;
+var FS_DOWN = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc; uniform vec2 uTexel;
+in vec2 vUv; out vec4 o;
+void main(){
+  vec3 s = texture(uSrc, vUv + uTexel * vec2(-0.5, -0.5)).rgb + texture(uSrc, vUv + uTexel * vec2(0.5, -0.5)).rgb
+         + texture(uSrc, vUv + uTexel * vec2(-0.5, 0.5)).rgb + texture(uSrc, vUv + uTexel * vec2(0.5, 0.5)).rgb;
+  o = vec4(s * 0.25, 1.0);
+}`;
+var GLRenderer = class {
+  constructor(canvas) {
+    const gl = canvas.getContext("webgl2", {
+      antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: false
+    });
+    if (!gl) throw new Error("This browser does not support WebGL2.");
+    this.gl = gl;
+    this.canvas = canvas;
+    this.hdr = !!gl.getExtension("EXT_color_buffer_float");
+    this.pGrid = this.program(FS_GRID);
+    this.pBlur = this.program(FS_BLUR);
+    this.pDown = this.program(FS_DOWN);
+    this.vao = gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,
+      -1,
+      3,
+      -1,
+      -1,
+      3
+    ]), gl.STATIC_DRAW);
+    for (const p of [
+      this.pGrid,
+      this.pBlur,
+      this.pDown
+    ]) {
+      const loc = gl.getAttribLocation(p.prog, "aPos");
+      if (loc >= 0) {
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      }
+    }
+    gl.useProgram(this.pGrid.prog);
+    gl.uniform1i(this.pGrid.u.uT0, 0);
+    gl.uniform1i(this.pGrid.u.uT1, 1);
+    gl.uniform1i(this.pGrid.u.uAtlas, 2);
+    gl.uniform1i(this.pGrid.u.uB1, 3);
+    gl.uniform1i(this.pGrid.u.uB2, 4);
+    gl.useProgram(this.pBlur.prog);
+    gl.uniform1i(this.pBlur.u.uSrc, 5);
+    gl.useProgram(this.pDown.prog);
+    gl.uniform1i(this.pDown.u.uSrc, 5);
+    this.t0 = this.texture(gl.NEAREST);
+    this.t1 = this.texture(gl.NEAREST);
+    this.atlas = this.texture(gl.NEAREST);
+    this.black = this.texture(gl.NEAREST);
+    gl.bindTexture(gl.TEXTURE_2D, this.black);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([
+      0,
+      0,
+      0,
+      255
+    ]));
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    this.gridW = 0;
+    this.gridH = 0;
+    this.targetsFor = "";
+  }
+  program(fs) {
+    const gl = this.gl;
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(prog, 0, "aPos");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const u = {};
+    const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) {
+      const info2 = gl.getActiveUniform(prog, i);
+      u[info2.name] = gl.getUniformLocation(prog, info2.name);
+    }
+    return {
+      prog,
+      u
+    };
+  }
+  texture(filter) {
+    const gl = this.gl;
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  target(w, h) {
+    const gl = this.gl;
+    const tex = this.texture(gl.LINEAR);
+    if (this.hdr) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && this.hdr) {
+      this.hdr = false;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return this.target(w, h);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return {
+      tex,
+      fb,
+      w,
+      h
+    };
+  }
+  ensureTargets() {
+    const W = this.canvas.width, H = this.canvas.height;
+    const key = W + "x" + H;
+    if (this.targetsFor === key) return;
+    const gl = this.gl;
+    for (const t of [
+      this.E,
+      this.Q1,
+      this.Q2,
+      this.O1,
+      this.O2
+    ]) if (t) {
+      gl.deleteTexture(t.tex);
+      gl.deleteFramebuffer(t.fb);
+    }
+    this.E = this.target(Math.max(1, Math.ceil(W / 2)), Math.max(1, Math.ceil(H / 2)));
+    this.Q1 = this.target(Math.max(1, Math.ceil(W / 4)), Math.max(1, Math.ceil(H / 4)));
+    this.Q2 = this.target(this.Q1.w, this.Q1.h);
+    this.O1 = this.target(Math.max(1, Math.ceil(W / 8)), Math.max(1, Math.ceil(H / 8)));
+    this.O2 = this.target(this.O1.w, this.O1.h);
+    this.targetsFor = key;
+  }
+  setAtlas(font) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.atlas);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, font.canvas);
+    this.font = font;
+  }
+  upload(grid) {
+    const gl = this.gl;
+    const a = new Uint8Array(grid.tex0.buffer), b = new Uint8Array(grid.tex1.buffer);
+    if (grid.cols !== this.gridW || grid.rows !== this.gridH) {
+      gl.bindTexture(gl.TEXTURE_2D, this.t0);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, grid.cols, grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, a);
+      gl.bindTexture(gl.TEXTURE_2D, this.t1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, grid.cols, grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, b);
+      this.gridW = grid.cols;
+      this.gridH = grid.rows;
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, this.t0);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, grid.cols, grid.rows, gl.RGBA, gl.UNSIGNED_BYTE, a);
+      gl.bindTexture(gl.TEXTURE_2D, this.t1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, grid.cols, grid.rows, gl.RGBA, gl.UNSIGNED_BYTE, b);
+    }
+  }
+  pass(p, target) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fb : null);
+    gl.viewport(0, 0, target ? target.w : this.canvas.width, target ? target.h : this.canvas.height);
+    gl.useProgram(p.prog);
+  }
+  bind(unit, tex) {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+  }
+  blur(src, tmp) {
+    const gl = this.gl;
+    this.pass(this.pBlur, tmp);
+    this.bind(5, src.tex);
+    gl.uniform2f(this.pBlur.u.uDir, 1 / src.w, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.pass(this.pBlur, src);
+    this.bind(5, tmp.tex);
+    gl.uniform2f(this.pBlur.u.uDir, 0, 1 / src.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  down(src, dst) {
+    const gl = this.gl;
+    this.pass(this.pDown, dst);
+    this.bind(5, src.tex);
+    gl.uniform2f(this.pDown.u.uTexel, 1 / src.w, 1 / src.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  // layout: { ox, oy } grid origin in device pixels.
+  draw(grid, layout, { bloom = 0.9, vignette = 0.35, exposure = 1, saturation = 1 } = {}) {
+    const gl = this.gl, f = this.font;
+    grid.pack();
+    this.upload(grid);
+    gl.bindVertexArray(this.vao);
+    this.ensureTargets();
+    this.bind(3, this.black);
+    this.bind(4, this.black);
+    this.bind(0, this.t0);
+    this.bind(1, this.t1);
+    this.bind(2, this.atlas);
+    const setGrid = (scale, mode) => {
+      const u = this.pGrid.u;
+      gl.uniform2f(u.uOrigin, layout.ox, layout.oy);
+      gl.uniform2f(u.uCell, f.cellW, f.cellH);
+      gl.uniform2i(u.uGrid, grid.cols, grid.rows);
+      gl.uniform1f(u.uCanvasH, this.canvas.height);
+      gl.uniform1f(u.uScale, scale);
+      gl.uniform1i(u.uMode, mode);
+      gl.uniform1f(u.uRange, HDR_RANGE);
+    };
+    if (bloom > 0) {
+      this.pass(this.pGrid, this.E);
+      setGrid(this.canvas.width / this.E.w, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      this.down(this.E, this.Q1);
+      this.blur(this.Q1, this.Q2);
+      this.down(this.Q1, this.O1);
+      this.blur(this.O1, this.O2);
+      this.blur(this.O1, this.O2);
+    }
+    this.pass(this.pGrid, null);
+    this.bind(0, this.t0);
+    this.bind(1, this.t1);
+    this.bind(2, this.atlas);
+    this.bind(3, bloom > 0 ? this.Q1.tex : this.black);
+    this.bind(4, bloom > 0 ? this.O1.tex : this.black);
+    setGrid(1, 0);
+    gl.uniform1f(this.pGrid.u.uBloom, bloom);
+    gl.uniform1f(this.pGrid.u.uVig, vignette);
+    gl.uniform1f(this.pGrid.u.uExposure, exposure);
+    gl.uniform1f(this.pGrid.u.uSat, saturation);
+    gl.uniform1f(this.pGrid.u.uRange, HDR_RANGE);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+};
+
+// src/font.js
+var FONT_STACK = '"JetBrains Mono", "DejaVu Sans Mono", "Menlo", "Consolas", "Liberation Mono", monospace';
+var LINE_H = 1.14;
+var EDGE_SET = " .,:;'`\"^-_=~+*/\\|()<>[]!oO#%&@";
+async function waitForFont(weight, timeoutMs = 2500) {
+  if (!document.fonts) return;
+  const t = new Promise((r) => setTimeout(r, timeoutMs));
+  try {
+    await Promise.race([
+      document.fonts.load(`${weight} 16px "JetBrains Mono"`),
+      t
+    ]);
+    await Promise.race([
+      document.fonts.ready,
+      t
+    ]);
+  } catch {
+  }
+}
+function buildFont(cssPx, dpr, weight = 600) {
+  const px = Math.max(6, Math.round(cssPx * dpr));
+  const c = document.createElement("canvas");
+  let ctx = c.getContext("2d", {
+    willReadFrequently: true
+  });
+  const font = `${weight} ${px}px ${FONT_STACK}`;
+  ctx.font = font;
+  const m = ctx.measureText("M");
+  const cellW = Math.max(3, Math.round(m.width));
+  const cellH = Math.max(5, Math.round(px * LINE_H));
+  const asc = m.fontBoundingBoxAscent || px * 0.8;
+  const desc = m.fontBoundingBoxDescent || px * 0.22;
+  c.width = cellW * 16;
+  c.height = cellH * 6;
+  ctx = c.getContext("2d", {
+    willReadFrequently: true
+  });
+  ctx.font = font;
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  const base = Math.round((cellH - (asc + desc)) / 2 + asc);
+  for (let i = 0; i < 95; i++) {
+    const x = i % 16 * cellW, y = Math.floor(i / 16) * cellH;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, cellW, cellH);
+    ctx.clip();
+    ctx.fillText(String.fromCharCode(32 + i), x + cellW / 2, y + base);
+    ctx.restore();
+  }
+  const img = ctx.getImageData(0, 0, c.width, c.height).data;
+  const cov = new Float32Array(95 * 9);
+  for (let i = 0; i < 95; i++) {
+    const gx = i % 16 * cellW, gy = Math.floor(i / 16) * cellH;
+    for (let ry = 0; ry < 3; ry++) {
+      for (let rx = 0; rx < 3; rx++) {
+        const x0 = Math.floor(rx * cellW / 3), x1 = Math.floor((rx + 1) * cellW / 3);
+        const y0 = Math.floor(ry * cellH / 3), y1 = Math.floor((ry + 1) * cellH / 3);
+        let s = 0, n = 0;
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+          s += img[((gy + y) * c.width + gx + x) * 4 + 3];
+          n++;
+        }
+        cov[i * 9 + ry * 3 + rx] = n ? s / (n * 255) : 0;
+      }
+    }
+  }
+  const cand = [
+    ...EDGE_SET
+  ].map((ch) => ch.charCodeAt(0) - 32);
+  const mx = new Float32Array(9);
+  for (const g of cand) for (let k = 0; k < 9; k++) mx[k] = Math.max(mx[k], cov[g * 9 + k]);
+  const norm2 = (g, k) => cov[g * 9 + k] / (mx[k] || 1);
+  const maskTable = new Uint8Array(512);
+  for (let m2 = 0; m2 < 512; m2++) {
+    let best = 32, bestE = 1e9;
+    for (const g of cand) {
+      let e = 0;
+      for (let k = 0; k < 9; k++) {
+        const t = m2 >> k & 1;
+        const v = Math.min(1, norm2(g, k) * 1.6);
+        const d = t - v;
+        e += d * d * (t ? 1 : 1.5);
+      }
+      if (e < bestE) {
+        bestE = e;
+        best = g + 32;
+      }
+    }
+    maskTable[m2] = best;
+  }
+  maskTable[0] = 32;
+  const maskTableSq = matchTable(" .,_-=|[]#:;'", cov, mx);
+  return {
+    canvas: c,
+    cellW,
+    cellH,
+    px,
+    dpr,
+    maskTable,
+    maskTableSq,
+    aspect: cellW / cellH
+  };
+}
+function matchTable(set, cov, mx) {
+  const cand = [
+    ...set
+  ].map((ch) => ch.charCodeAt(0) - 32);
+  const t = new Uint8Array(512);
+  for (let m = 1; m < 512; m++) {
+    let best = 32, bestE = 1e9;
+    for (const g of cand) {
+      let e = 0;
+      for (let k = 0; k < 9; k++) {
+        const tt = m >> k & 1;
+        const d = tt - Math.min(1, cov[g * 9 + k] / (mx[k] || 1) * 1.6);
+        e += d * d * (tt ? 1 : 1.5);
+      }
+      if (e < bestE) {
+        bestE = e;
+        best = g + 32;
+      }
+    }
+    t[m] = best;
+  }
+  t[0] = 32;
+  return t;
+}
+
+// src/util.js
+var TAU = Math.PI * 2;
+var DEG = Math.PI / 180;
+var clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+var smoothstep = (a, b, x) => {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+var wrap360 = (a) => (a % 360 + 360) % 360;
+function hash3(a, b, c) {
+  let h = Math.imul(a | 0, 668265261) ^ Math.imul(b | 0, 374761393) ^ Math.imul(c | 0, 2654435761);
+  h = Math.imul(h ^ h >>> 15, 2246822507);
+  h = Math.imul(h ^ h >>> 13, 3266489909);
+  return (h ^ h >>> 16) >>> 0;
+}
+var hashf = (a, b = 0, c = 0) => hash3(a, b, c) / 4294967296;
+var RNG = class {
+  constructor(seed) {
+    this.s = seed >>> 0 || 1;
+  }
+  next() {
+    let t = this.s = this.s + 1831565813 | 0;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+  range(a, b) {
+    return a + (b - a) * this.next();
+  }
+  int(a, b) {
+    return a + Math.floor(this.next() * (b - a + 1));
+  }
+  pick(arr) {
+    return arr[Math.floor(this.next() * arr.length)];
+  }
+  chance(p) {
+    return this.next() < p;
+  }
+  gauss() {
+    return Math.sqrt(-2 * Math.log(1 - this.next())) * Math.cos(TAU * this.next());
+  }
+};
+var PERM = new Uint8Array(512);
+{
+  const r = new RNG(1337);
+  const p = Array.from({
+    length: 256
+  }, (_, i) => i);
+  for (let i = 255; i > 0; i--) {
+    const j = Math.floor(r.next() * (i + 1));
+    const t = p[i];
+    p[i] = p[j];
+    p[j] = t;
+  }
+  for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+}
+var GX = new Float64Array(256);
+var GY = new Float64Array(256);
+var GZ = new Float64Array(256);
+{
+  const E = [
+    [
+      1,
+      1,
+      0
+    ],
+    [
+      -1,
+      1,
+      0
+    ],
+    [
+      1,
+      -1,
+      0
+    ],
+    [
+      -1,
+      -1,
+      0
+    ],
+    [
+      1,
+      0,
+      1
+    ],
+    [
+      -1,
+      0,
+      1
+    ],
+    [
+      1,
+      0,
+      -1
+    ],
+    [
+      -1,
+      0,
+      -1
+    ],
+    [
+      0,
+      1,
+      1
+    ],
+    [
+      0,
+      -1,
+      1
+    ],
+    [
+      0,
+      1,
+      -1
+    ],
+    [
+      0,
+      -1,
+      -1
+    ],
+    [
+      1,
+      1,
+      0
+    ],
+    [
+      -1,
+      1,
+      0
+    ],
+    [
+      0,
+      -1,
+      1
+    ],
+    [
+      0,
+      -1,
+      -1
+    ]
+  ];
+  for (let i = 0; i < 256; i++) {
+    const e = E[i & 15];
+    GX[i] = e[0];
+    GY[i] = e[1];
+    GZ[i] = e[2];
+  }
+}
+function noise3(x, y, z) {
+  let X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
+  x -= X;
+  y -= Y;
+  z -= Z;
+  X &= 255;
+  Y &= 255;
+  Z &= 255;
+  const u = x * x * x * (x * (x * 6 - 15) + 10), v = y * y * y * (y * (y * 6 - 15) + 10), w = z * z * z * (z * (z * 6 - 15) + 10);
+  const A = PERM[X] + Y, AA = PERM[A] + Z, AB = PERM[A + 1] + Z;
+  const B = PERM[X + 1] + Y, BA = PERM[B] + Z, BB = PERM[B + 1] + Z;
+  const x1 = x - 1, y1 = y - 1, z1 = z - 1;
+  let h = PERM[AA];
+  const g000 = GX[h] * x + GY[h] * y + GZ[h] * z;
+  h = PERM[BA];
+  const g100 = GX[h] * x1 + GY[h] * y + GZ[h] * z;
+  h = PERM[AB];
+  const g010 = GX[h] * x + GY[h] * y1 + GZ[h] * z;
+  h = PERM[BB];
+  const g110 = GX[h] * x1 + GY[h] * y1 + GZ[h] * z;
+  h = PERM[AA + 1];
+  const g001 = GX[h] * x + GY[h] * y + GZ[h] * z1;
+  h = PERM[BA + 1];
+  const g101 = GX[h] * x1 + GY[h] * y + GZ[h] * z1;
+  h = PERM[AB + 1];
+  const g011 = GX[h] * x + GY[h] * y1 + GZ[h] * z1;
+  h = PERM[BB + 1];
+  const g111 = GX[h] * x1 + GY[h] * y1 + GZ[h] * z1;
+  const a0 = g000 + u * (g100 - g000), a1 = g010 + u * (g110 - g010);
+  const b0 = g001 + u * (g101 - g001), b1 = g011 + u * (g111 - g011);
+  const c0 = a0 + v * (a1 - a0), c1 = b0 + v * (b1 - b0);
+  return c0 + w * (c1 - c0);
+}
+function fbm3(x, y, z, oct = 4, lac = 2.03, gain = 0.5) {
+  let s = 0, amp = 1, n = 0;
+  const full = Math.floor(oct), part = oct - full;
+  for (let i = 0; i < full + (part > 0.01 ? 1 : 0); i++) {
+    const a = i < full ? amp : amp * part;
+    s += a * noise3(x + i * 31.7, y - i * 17.3, z + i * 7.1);
+    n += a;
+    amp *= gain;
+    x *= lac;
+    y *= lac;
+    z *= lac;
+  }
+  return n > 0 ? s / n : 0;
+}
+function ridged3(x, y, z, oct = 4) {
+  let s = 0, amp = 1, n = 0;
+  for (let i = 0; i < oct; i++) {
+    const v = 1 - Math.abs(noise3(x + i * 13.1, y + i * 3.7, z - i * 9.9));
+    s += amp * v * v;
+    n += amp;
+    amp *= 0.5;
+    x *= 2.07;
+    y *= 2.07;
+    z *= 2.07;
+  }
+  return s / n;
+}
+var add = (a, b) => [
+  a[0] + b[0],
+  a[1] + b[1],
+  a[2] + b[2]
+];
+var sub = (a, b) => [
+  a[0] - b[0],
+  a[1] - b[1],
+  a[2] - b[2]
+];
+var mul = (a, k) => [
+  a[0] * k,
+  a[1] * k,
+  a[2] * k
+];
+var dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+var cross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0]
+];
+var len = (a) => Math.hypot(a[0], a[1], a[2]);
+var norm = (a) => {
+  const l = Math.hypot(a[0], a[1], a[2]) || 1;
+  return [
+    a[0] / l,
+    a[1] / l,
+    a[2] / l
+  ];
+};
+function rotate(v, k, a) {
+  const c = Math.cos(a), s = Math.sin(a), d = dot(k, v) * (1 - c);
+  return [
+    v[0] * c + (k[1] * v[2] - k[2] * v[1]) * s + k[0] * d,
+    v[1] * c + (k[2] * v[0] - k[0] * v[2]) * s + k[1] * d,
+    v[2] * c + (k[0] * v[1] - k[1] * v[0]) * s + k[2] * d
+  ];
+}
+var fromLatLon = (lat, lon) => {
+  const la = lat * DEG, lo = lon * DEG;
+  return [
+    Math.cos(la) * Math.cos(lo),
+    Math.cos(la) * Math.sin(lo),
+    Math.sin(la)
+  ];
+};
+var hex = (h) => [
+  (h >> 16 & 255) / 255,
+  (h >> 8 & 255) / 255,
+  (h & 255) / 255
+];
+function blackbody(K2) {
+  const t = K2 / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.47 * Math.log(t) - 161.12;
+    b = t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
+  } else {
+    r = 329.7 * Math.pow(t - 60, -0.1332);
+    g = 288.12 * Math.pow(t - 60, -0.0755);
+    b = 255;
+  }
+  r = clamp(r, 0, 255) / 255;
+  g = clamp(g, 0, 255) / 255;
+  b = clamp(b, 0, 255) / 255;
+  const m = Math.max(r, g, b);
+  return [
+    r / m,
+    g / m,
+    b / m
+  ];
+}
+var fmtInt = (n) => Math.round(n).toLocaleString("en-US");
+function fmtDist(km) {
+  const AU2 = 1495978707e-1;
+  if (km < 1) return `${Math.round(km * 1e3)} m`;
+  if (km < 10) return `${km.toFixed(2)} km`;
+  if (km < 1e6) return `${fmtInt(km)} km`;
+  if (km < 0.1 * AU2) return `${(km / 1e6).toFixed(2)} million km`;
+  return `${(km / AU2).toFixed(km < 10 * AU2 ? 3 : 2)} AU`;
+}
+function fmtSpeed(kms) {
+  const C = 299792.458;
+  if (kms < 1) return `${Math.round(kms * 1e3)} m/s`;
+  if (kms < 0.1 * C) return `${kms < 100 ? kms.toFixed(1) : fmtInt(kms)} km/s`;
+  return `${(kms / C).toFixed(kms < 10 * C ? 2 : 0)} c`;
+}
+function fmtDuration(s) {
+  if (!isFinite(s)) return "--";
+  if (s < 60) return `${Math.max(0, Math.round(s))} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
+  if (s < 86400 * 2) return `${(s / 3600).toFixed(1)} h`;
+  if (s < 86400 * 365 * 2) return `${(s / 86400).toFixed(1)} days`;
+  return `${(s / 86400 / 365.25).toFixed(1)} years`;
+}
+
+// src/astro.js
+var AU = 1495978707e-1;
+var C_KMS = 299792.458;
+var J2000 = 2451545;
+var OBLIQUITY = 23.4392911 * DEG;
+var GM_SUN = 132712440018;
+var jdFromMs = (ms) => ms / 864e5 + 24405875e-1;
+var msFromJd = (jd) => (jd - 24405875e-1) * 864e5;
+function eqToEcl(v) {
+  const c = Math.cos(OBLIQUITY), s = Math.sin(OBLIQUITY);
+  return [
+    v[0],
+    v[1] * c + v[2] * s,
+    -v[1] * s + v[2] * c
+  ];
+}
+function radecToEcl(ra, dec) {
+  const a = ra * DEG, d = dec * DEG;
+  return eqToEcl([
+    Math.cos(d) * Math.cos(a),
+    Math.cos(d) * Math.sin(a),
+    Math.sin(d)
+  ]);
+}
+function keplerE(M, e) {
+  let E = e < 0.8 ? M : Math.PI;
+  for (let k = 0; k < 12; k++) {
+    const d = (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+    E -= d;
+    if (Math.abs(d) < 1e-12) break;
+  }
+  return E;
+}
+function orbitXYZ(a, e, inc, node, argp, M, out) {
+  const E = keplerE(M, e);
+  const xv = a * (Math.cos(E) - e), yv = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const cO = Math.cos(node), sO = Math.sin(node), cw = Math.cos(argp), sw = Math.sin(argp), ci = Math.cos(inc), si = Math.sin(inc);
+  const x1 = xv * cw - yv * sw, y1 = xv * sw + yv * cw;
+  out[0] = x1 * cO - y1 * ci * sO;
+  out[1] = x1 * sO + y1 * ci * cO;
+  out[2] = y1 * si;
+  return out;
+}
+var PLANET_ELEMENTS = {
+  mercury: [
+    0.38709927,
+    0.20563593,
+    7.00497902,
+    252.2503235,
+    77.45779628,
+    48.33076593,
+    37e-8,
+    1906e-8,
+    -594749e-8,
+    149472.67411175,
+    0.16047689,
+    -0.12534081
+  ],
+  venus: [
+    0.72333566,
+    677672e-8,
+    3.39467605,
+    181.9790995,
+    131.60246718,
+    76.67984255,
+    39e-7,
+    -4107e-8,
+    -7889e-7,
+    58517.81538729,
+    268329e-8,
+    -0.27769418
+  ],
+  emb: [
+    1.00000261,
+    0.01671123,
+    -1531e-8,
+    100.46457166,
+    102.93768193,
+    0,
+    562e-8,
+    -4392e-8,
+    -0.01294668,
+    35999.37244981,
+    0.32327364,
+    0
+  ],
+  mars: [
+    1.52371034,
+    0.0933941,
+    1.84969142,
+    -4.55343205,
+    -23.94362959,
+    49.55953891,
+    1847e-8,
+    7882e-8,
+    -813131e-8,
+    19140.30268499,
+    0.44441088,
+    -0.29257343
+  ],
+  jupiter: [
+    5.202887,
+    0.04838624,
+    1.30439695,
+    34.39644051,
+    14.72847983,
+    100.47390909,
+    -11607e-8,
+    -13253e-8,
+    -183714e-8,
+    3034.74612775,
+    0.21252668,
+    0.20469106
+  ],
+  saturn: [
+    9.53667594,
+    0.05386179,
+    2.48599187,
+    49.95424423,
+    92.59887831,
+    113.66242448,
+    -12506e-7,
+    -50991e-8,
+    193609e-8,
+    1222.49362201,
+    -0.41897216,
+    -0.28867794
+  ],
+  uranus: [
+    19.18916464,
+    0.04725744,
+    0.77263783,
+    313.23810451,
+    170.9542763,
+    74.01692503,
+    -196176e-8,
+    -4397e-8,
+    -242939e-8,
+    428.48202785,
+    0.40805281,
+    0.04240589
+  ],
+  neptune: [
+    30.06992276,
+    859048e-8,
+    1.77004347,
+    -55.12002969,
+    44.96476227,
+    131.78422574,
+    26291e-8,
+    5105e-8,
+    35372e-8,
+    218.45945325,
+    -0.32241464,
+    -508664e-8
+  ],
+  pluto: [
+    39.48211675,
+    0.2488273,
+    17.14001206,
+    238.92903833,
+    224.06891629,
+    110.30393684,
+    -31596e-8,
+    517e-7,
+    4818e-8,
+    145.20780515,
+    -0.04062942,
+    -0.01183482
+  ]
+};
+function planetElements(key, jd) {
+  const p = PLANET_ELEMENTS[key], T = (jd - J2000) / 36525;
+  const a = (p[0] + p[6] * T) * AU, e = p[1] + p[7] * T, I = p[2] + p[8] * T;
+  const L = p[3] + p[9] * T, w = p[4] + p[10] * T, O2 = p[5] + p[11] * T;
+  return {
+    a,
+    e,
+    i: I * DEG,
+    node: O2 * DEG,
+    argp: (w - O2) * DEG,
+    M: wrap360(L - w) * DEG
+  };
+}
+function planetPos(key, jd, out = [
+  0,
+  0,
+  0
+]) {
+  const el = planetElements(key, jd);
+  return orbitXYZ(el.a, el.e, el.i, el.node, el.argp, el.M, out);
+}
+function moonGeo(jd, out = [
+  0,
+  0,
+  0
+]) {
+  const d = jd - 24515435e-1;
+  const N = (125.1228 - 0.0529538083 * d) * DEG;
+  const inc = 5.1454 * DEG;
+  const w = (318.0634 + 0.1643573223 * d) * DEG;
+  const e = 0.0549;
+  const Mm = wrap360(115.3654 + 13.0649929509 * d) * DEG;
+  const Ms = wrap360(356.047 + 0.9856002585 * d) * DEG;
+  const ws = (282.9404 + 470935e-10 * d) * DEG;
+  const E = keplerE(Mm, e);
+  const xv = Math.cos(E) - e, yv = Math.sqrt(1 - e * e) * Math.sin(E);
+  const v = Math.atan2(yv, xv);
+  let r = 60.2666 * Math.hypot(xv, yv);
+  const xh = r * (Math.cos(N) * Math.cos(v + w) - Math.sin(N) * Math.sin(v + w) * Math.cos(inc));
+  const yh = r * (Math.sin(N) * Math.cos(v + w) + Math.cos(N) * Math.sin(v + w) * Math.cos(inc));
+  const zh = r * Math.sin(v + w) * Math.sin(inc);
+  let lon = Math.atan2(yh, xh), lat = Math.atan2(zh, Math.hypot(xh, yh));
+  const Lm = N + w + Mm, Ls = Ms + ws, D = Lm - Ls, F = Lm - N;
+  lon += DEG * (-1.274 * Math.sin(Mm - 2 * D) + 0.658 * Math.sin(2 * D) - 0.186 * Math.sin(Ms) - 0.059 * Math.sin(2 * Mm - 2 * D) - 0.057 * Math.sin(Mm - 2 * D + Ms) + 0.053 * Math.sin(Mm + 2 * D) + 0.046 * Math.sin(2 * D - Ms) + 0.041 * Math.sin(Mm - Ms) - 0.035 * Math.sin(D) - 0.031 * Math.sin(Mm + Ms) - 0.015 * Math.sin(2 * F - 2 * D) + 0.011 * Math.sin(Mm - 4 * D));
+  lat += DEG * (-0.173 * Math.sin(F - 2 * D) - 0.055 * Math.sin(Mm - F - 2 * D) - 0.046 * Math.sin(Mm + F - 2 * D) + 0.033 * Math.sin(F + 2 * D) + 0.017 * Math.sin(2 * Mm + F));
+  r += -0.58 * Math.cos(Mm - 2 * D) - 0.46 * Math.cos(2 * D);
+  const km = r * 6378.14;
+  out[0] = km * Math.cos(lat) * Math.cos(lon);
+  out[1] = km * Math.cos(lat) * Math.sin(lon);
+  out[2] = km * Math.sin(lat);
+  return out;
+}
+function poleBasis(ra, dec) {
+  const a = ra * DEG, d = dec * DEG;
+  const z = [
+    Math.cos(d) * Math.cos(a),
+    Math.cos(d) * Math.sin(a),
+    Math.sin(d)
+  ];
+  const n = [
+    -Math.sin(a),
+    Math.cos(a),
+    0
+  ];
+  const q = [
+    z[1] * n[2] - z[2] * n[1],
+    z[2] * n[0] - z[0] * n[2],
+    z[0] * n[1] - z[1] * n[0]
+  ];
+  return {
+    z: eqToEcl(z),
+    n: eqToEcl(n),
+    q: eqToEcl(q)
+  };
+}
+function spinAxes(pb, W, out) {
+  const c = Math.cos(W * DEG), s = Math.sin(W * DEG);
+  const x = out[0], y = out[1], z = out[2];
+  x[0] = pb.n[0] * c + pb.q[0] * s;
+  x[1] = pb.n[1] * c + pb.q[1] * s;
+  x[2] = pb.n[2] * c + pb.q[2] * s;
+  z[0] = pb.z[0];
+  z[1] = pb.z[1];
+  z[2] = pb.z[2];
+  y[0] = z[1] * x[2] - z[2] * x[1];
+  y[1] = z[2] * x[0] - z[0] * x[2];
+  y[2] = z[0] * x[1] - z[1] * x[0];
+  return out;
+}
+function formatDate(jd) {
+  const d = new Date(msFromJd(jd));
+  if (isNaN(d.getTime())) return "----";
+  const p = (n, k = 2) => String(n).padStart(k, "0");
+  const y = d.getUTCFullYear();
+  return `${y < 0 ? "-" + p(-y, 4) : p(y, 4)}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+
+// src/bodies.js
+var K = {
+  SPACE: 0,
+  ROCK: 1,
+  ICE: 2,
+  GAS: 3,
+  UI: 4,
+  OCEAN: 5,
+  CLOUD: 6,
+  LAND: 7,
+  RING: 8,
+  SUN: 9,
+  HAZE: 10,
+  FLAT: 12,
+  DUST: 13
+};
+var info = (o) => o;
+var BODIES = [
+  {
+    id: "sun",
+    name: "Sun",
+    kind: "star",
+    parent: null,
+    R: [
+      695700,
+      695700
+    ],
+    gm: GM_SUN,
+    rot: {
+      ra: 286.13,
+      dec: 63.87,
+      W0: 84.176,
+      Wd: 14.1844
+    },
+    look: {
+      ramp: K.SUN,
+      col: [
+        1,
+        0.86,
+        0.62
+      ]
+    },
+    info: info({
+      type: "G2V main-sequence star",
+      diameter: "1,392,700 km",
+      mass: "333,000 Earths",
+      gravity: "274 m/s2 (28 g)",
+      day: "25.4 days at the equator, 34 near the poles",
+      temp: "photosphere 5,500 C, corona above 1,000,000 C",
+      facts: [
+        "Holds 99.86% of the mass of the Solar System.",
+        "Light from its surface takes 8 min 20 s to reach Earth."
+      ]
+    })
+  },
+  // ---------------------------------------------------------------------------------------- MERCURY
+  {
+    id: "mercury",
+    name: "Mercury",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      2440.5,
+      2438.3
+    ],
+    gm: 22031.8,
+    orbit: {
+      planet: "mercury"
+    },
+    rot: {
+      ra: 281.0103,
+      dec: 61.4155,
+      W0: 329.5988,
+      Wd: 6.1385108
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.56,
+        0.53,
+        0.5
+      ],
+      paint: "mercury",
+      tex: 512
+    },
+    info: info({
+      type: "Terrestrial planet",
+      diameter: "4,879 km",
+      mass: "0.055 Earths",
+      gravity: "3.7 m/s2",
+      day: "58.6 days (sidereal), 176 days sunrise to sunrise",
+      year: "88 days",
+      temp: "-180 C at night to 430 C by day",
+      atmo: "none (a thin exosphere of sodium and potassium)",
+      moons: "none",
+      facts: [
+        "The Caloris basin, 1,550 km wide, is one of the largest impact scars known.",
+        "Spins exactly three times for every two orbits."
+      ]
+    })
+  },
+  // ------------------------------------------------------------------------------------------ VENUS
+  {
+    id: "venus",
+    name: "Venus",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      6051.8 + 68,
+      6051.8 + 68
+    ],
+    solidR: 6051.8,
+    gm: 324858.6,
+    orbit: {
+      planet: "venus"
+    },
+    rot: {
+      ra: 272.76,
+      dec: 67.16,
+      W0: 160.2,
+      Wd: -1.4813688
+    },
+    look: {
+      ramp: K.CLOUD,
+      col: [
+        0.93,
+        0.85,
+        0.66
+      ],
+      paint: "venus",
+      tex: 512,
+      cloudDrift: -88.5,
+      minnaert: 0.75
+    },
+    atmo: {
+      top: 32,
+      minAlt: 6,
+      P0: 0.08,
+      T: 250,
+      label: "sulfuric-acid haze above the cloud deck",
+      comps: [
+        {
+          H: 5.5,
+          beta: [
+            15e-4,
+            24e-4,
+            42e-4
+          ],
+          abs: [
+            0,
+            0,
+            8e-4
+          ],
+          g: 0
+        },
+        {
+          H: 4,
+          beta: [
+            0.05,
+            0.044,
+            0.03
+          ],
+          abs: [
+            1e-3,
+            3e-3,
+            0.01
+          ],
+          g: 0.7,
+          ms: 0.5
+        }
+      ]
+    },
+    info: info({
+      type: "Terrestrial planet",
+      diameter: "12,104 km",
+      mass: "0.815 Earths",
+      gravity: "8.87 m/s2",
+      day: "243 days, retrograde (longer than its year)",
+      year: "224.7 days",
+      temp: "465 C at the surface; about -10 C at the cloud tops",
+      atmo: "96% carbon dioxide, 92 bar at the surface, clouds of sulfuric acid",
+      moons: "none",
+      facts: [
+        "The cloud deck races around the planet every four days, sixty times faster than the ground turns.",
+        "You are flying above the clouds: the surface is 65 km below, hidden in permanent overcast."
+      ]
+    })
+  },
+  // ------------------------------------------------------------------------------------------ EARTH
+  {
+    id: "earth",
+    name: "Earth",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      6378.137,
+      6356.752
+    ],
+    gm: 398600.4418,
+    orbit: {
+      emb: true
+    },
+    rot: {
+      ra: 0,
+      dec: 90,
+      W0: 190.147,
+      Wd: 360.9856235
+    },
+    look: {
+      ramp: K.LAND,
+      col: [
+        0.35,
+        0.48,
+        0.7
+      ],
+      paint: "earth",
+      tex: 1024
+    },
+    atmo: {
+      top: 100,
+      minAlt: 18,
+      P0: 1.013,
+      T: 288,
+      label: "nitrogen and oxygen",
+      comps: [
+        {
+          H: 8,
+          beta: [
+            58e-4,
+            0.0135,
+            0.0331
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0
+        },
+        {
+          H: 1.2,
+          beta: [
+            4e-3,
+            4e-3,
+            4e-3
+          ],
+          abs: [
+            4e-4,
+            4e-4,
+            4e-4
+          ],
+          g: 0.76
+        }
+      ],
+      aurora: {
+        poleLat: 80.7,
+        poleLon: -72.7,
+        lat: 67,
+        col: [
+          0.25,
+          1,
+          0.45
+        ],
+        col2: [
+          0.9,
+          0.25,
+          0.4
+        ]
+      }
+    },
+    info: info({
+      type: "Terrestrial planet",
+      diameter: "12,742 km",
+      mass: "5.97 x 10^24 kg",
+      gravity: "9.81 m/s2",
+      day: "23 h 56 min",
+      year: "365.25 days",
+      temp: "average 15 C",
+      atmo: "78% nitrogen, 21% oxygen, 1 bar",
+      moons: "1",
+      facts: [
+        "The only world known to have liquid water on its surface, and life.",
+        "At night the coasts and river valleys glow with city light."
+      ]
+    })
+  },
+  {
+    id: "moon",
+    name: "Moon",
+    kind: "moon",
+    parent: "earth",
+    R: [
+      1738.1,
+      1736
+    ],
+    gm: 4902.8,
+    orbit: {
+      lunar: true
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.6,
+        0.58,
+        0.55
+      ],
+      paint: "moon",
+      tex: 1024,
+      ls: 0.7
+    },
+    info: info({
+      type: "Natural satellite of Earth",
+      diameter: "3,474 km",
+      mass: "0.0123 Earths",
+      gravity: "1.62 m/s2",
+      day: "tidally locked: 27.3 days",
+      year: "orbits Earth every 27.3 days at 384,400 km",
+      temp: "-170 C to 120 C",
+      facts: [
+        "The dark maria are ancient lava plains; the bright highlands are older still.",
+        "Tycho's rays of bright ejecta reach 1,500 km across the near side."
+      ]
+    })
+  },
+  // ------------------------------------------------------------------------------------------- MARS
+  {
+    id: "mars",
+    name: "Mars",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      3396.2,
+      3376.2
+    ],
+    gm: 42828.37,
+    orbit: {
+      planet: "mars"
+    },
+    rot: {
+      ra: 317.68143,
+      dec: 52.8865,
+      W0: 176.63,
+      Wd: 350.89198226
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.74,
+        0.45,
+        0.27
+      ],
+      paint: "mars",
+      tex: 1024,
+      relief: 1.4
+    },
+    atmo: {
+      top: 70,
+      minAlt: 7,
+      P0: 6e-3,
+      T: 210,
+      label: "thin carbon dioxide, full of fine dust",
+      comps: [
+        {
+          H: 11.1,
+          beta: [
+            8e-5,
+            18e-5,
+            45e-5
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0
+        },
+        {
+          H: 11,
+          beta: [
+            0.022,
+            0.015,
+            9e-3
+          ],
+          abs: [
+            2e-3,
+            6e-3,
+            0.012
+          ],
+          g: [
+            0.62,
+            0.7,
+            0.86
+          ],
+          ms: 0.25
+        }
+      ]
+    },
+    info: info({
+      type: "Terrestrial planet",
+      diameter: "6,779 km",
+      mass: "0.107 Earths",
+      gravity: "3.72 m/s2",
+      day: "24 h 37 min",
+      year: "687 days",
+      temp: "average -60 C",
+      atmo: "95% carbon dioxide, 0.006 bar",
+      moons: "2",
+      facts: [
+        "Olympus Mons rises 22 km above the plains of Tharsis.",
+        "Valles Marineris runs 4,000 km and plunges 7 km deep.",
+        "Its polar caps grow and shrink with the seasons."
+      ]
+    })
+  },
+  {
+    id: "phobos",
+    name: "Phobos",
+    kind: "moon",
+    parent: "mars",
+    R: [
+      13,
+      11.4,
+      9.1
+    ],
+    gm: 7087e-7,
+    orbit: {
+      a: 9376,
+      e: 0.0151,
+      i: 1.075,
+      node: 207.8,
+      argp: 150.1,
+      M0: 91
+    },
+    rot: {
+      locked: true
+    },
+    shape: {
+      amp: 0.11,
+      freq: 1.6,
+      seed: 31
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.36,
+        0.33,
+        0.3
+      ],
+      paint: "phobos",
+      tex: 256
+    },
+    info: info({
+      type: "Moon of Mars",
+      diameter: "27 x 22 x 18 km",
+      gravity: "0.0057 m/s2",
+      year: "orbits every 7 h 39 min, faster than Mars turns",
+      facts: [
+        "Stickney crater is 9 km wide, a third of the moon.",
+        "Spiralling inward; in ~50 million years it will break up into a ring."
+      ]
+    })
+  },
+  {
+    id: "deimos",
+    name: "Deimos",
+    kind: "moon",
+    parent: "mars",
+    R: [
+      7.8,
+      6,
+      5.1
+    ],
+    gm: 96e-6,
+    orbit: {
+      a: 23458,
+      e: 2e-4,
+      i: 1.788,
+      node: 24.5,
+      argp: 290.5,
+      M0: 296.2
+    },
+    rot: {
+      locked: true
+    },
+    shape: {
+      amp: 0.08,
+      freq: 1.4,
+      seed: 32
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.42,
+        0.38,
+        0.34
+      ],
+      tex: 256,
+      craters: 0.4,
+      smooth: 0.6
+    },
+    info: info({
+      type: "Moon of Mars",
+      diameter: "15 x 12 x 11 km",
+      year: "orbits every 30.3 hours",
+      facts: [
+        "A smooth little moon, its craters half buried in fine dust."
+      ]
+    })
+  },
+  // --------------------------------------------------------------------------------- ASTEROID BELT
+  {
+    id: "ceres",
+    name: "Ceres",
+    kind: "dwarf",
+    parent: "sun",
+    R: [
+      482.1,
+      482.1,
+      445.9
+    ],
+    gm: 62.6284,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.7675,
+      e: 0.0758,
+      i: 10.594,
+      node: 80.31,
+      argp: 73.6,
+      M0: 95.99,
+      epoch: 2451545
+    },
+    rot: {
+      ra: 291.418,
+      dec: 66.764,
+      W0: 170.65,
+      Wd: 952.1532
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.32,
+        0.31,
+        0.3
+      ],
+      paint: "ceres",
+      tex: 512
+    },
+    info: info({
+      type: "Dwarf planet, largest body of the asteroid belt",
+      diameter: "940 km",
+      mass: "1/3 of the whole belt",
+      gravity: "0.28 m/s2",
+      day: "9 h 4 min",
+      year: "4.6 years",
+      facts: [
+        "The bright spots in Occator crater are salts left by briny water that welled up from below.",
+        "Ahuna Mons is a lone 4 km ice volcano."
+      ]
+    })
+  },
+  {
+    id: "vesta",
+    name: "Vesta",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      286.3,
+      278.6,
+      223.2
+    ],
+    gm: 17.288,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.3615,
+      e: 0.0887,
+      i: 7.14,
+      node: 103.85,
+      argp: 151.2,
+      M0: 205.5,
+      epoch: 2451545
+    },
+    rot: {
+      ra: 309.031,
+      dec: 42.235,
+      W0: 285.39,
+      Wd: 1617.3329428
+    },
+    shape: {
+      amp: 0.06,
+      freq: 1.2,
+      seed: 41
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.55,
+        0.52,
+        0.48
+      ],
+      paint: "vesta",
+      tex: 512
+    },
+    info: info({
+      type: "Asteroid (protoplanet)",
+      diameter: "573 x 557 x 446 km",
+      day: "5 h 20 min",
+      year: "3.6 years",
+      facts: [
+        "Rheasilvia, a 505 km impact basin, gouges out its south pole with a central peak 22 km high.",
+        "Many meteorites found on Earth were blasted off Vesta."
+      ]
+    })
+  },
+  {
+    id: "pallas",
+    name: "Pallas",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      284,
+      266,
+      224
+    ],
+    gm: 13.63,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.773,
+      e: 0.2302,
+      i: 34.84,
+      node: 173.08,
+      argp: 310.15,
+      M0: 352.5,
+      epoch: 2451545
+    },
+    rot: {
+      elon: 30,
+      elat: -16,
+      W0: 0,
+      Wd: 1105.8
+    },
+    shape: {
+      amp: 0.05,
+      freq: 1.3,
+      seed: 42
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.4,
+        0.41,
+        0.43
+      ],
+      tex: 512,
+      craters: 1.2
+    },
+    info: info({
+      type: "Asteroid",
+      diameter: "512 km",
+      day: "7 h 49 min",
+      year: "4.6 years",
+      facts: [
+        "Its orbit is tilted 35 degrees, so it slams through the belt at high speed: its surface is unusually battered."
+      ]
+    })
+  },
+  {
+    id: "hygiea",
+    name: "Hygiea",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      225,
+      215,
+      212
+    ],
+    gm: 5.78,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 3.1415,
+      e: 0.1125,
+      i: 3.83,
+      node: 283.2,
+      argp: 312.3,
+      M0: 168,
+      epoch: 2451545
+    },
+    rot: {
+      elon: 115,
+      elat: 30,
+      W0: 0,
+      Wd: 624.7
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.27,
+        0.26,
+        0.25
+      ],
+      tex: 512,
+      craters: 0.8
+    },
+    info: info({
+      type: "Asteroid (dwarf planet candidate)",
+      diameter: "434 km",
+      day: "13 h 50 min",
+      year: "5.6 years",
+      facts: [
+        "Almost perfectly round: it may have reassembled after a huge collision."
+      ]
+    })
+  },
+  {
+    id: "juno",
+    name: "Juno",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      160,
+      133.5,
+      100
+    ],
+    gm: 1.82,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.6694,
+      e: 0.2562,
+      i: 12.99,
+      node: 169.85,
+      argp: 248.14,
+      M0: 30,
+      epoch: 2451545
+    },
+    rot: {
+      elon: 103,
+      elat: 27,
+      W0: 0,
+      Wd: 1198.3
+    },
+    shape: {
+      amp: 0.12,
+      freq: 1.5,
+      seed: 43
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.56,
+        0.5,
+        0.42
+      ],
+      tex: 256,
+      craters: 0.9
+    },
+    info: info({
+      type: "Asteroid (stony)",
+      diameter: "254 km",
+      day: "7 h 13 min",
+      year: "4.4 years",
+      facts: [
+        "One of the first four asteroids found, in 1804."
+      ]
+    })
+  },
+  {
+    id: "psyche",
+    name: "Psyche",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      139,
+      119,
+      85.5
+    ],
+    gm: 1.53,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.924,
+      e: 0.134,
+      i: 3.1,
+      node: 150.04,
+      argp: 229.2,
+      M0: 120,
+      epoch: 2451545
+    },
+    rot: {
+      elon: 32,
+      elat: -7,
+      W0: 0,
+      Wd: 2059.1
+    },
+    shape: {
+      amp: 0.1,
+      freq: 1.4,
+      seed: 44
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.5,
+        0.52,
+        0.55
+      ],
+      tex: 256,
+      craters: 0.7,
+      metal: 0.5
+    },
+    info: info({
+      type: "Asteroid (metallic)",
+      diameter: "279 x 232 x 189 km",
+      day: "4 h 12 min",
+      year: "5.0 years",
+      facts: [
+        "Rich in iron and nickel: perhaps the exposed core of a shattered protoplanet."
+      ]
+    })
+  },
+  {
+    id: "ida",
+    name: "Ida",
+    kind: "asteroid",
+    parent: "sun",
+    R: [
+      29.9,
+      12.7,
+      9.3
+    ],
+    gm: 282e-5,
+    belt: true,
+    orbit: {
+      helio: true,
+      a: 2.862,
+      e: 0.0451,
+      i: 1.13,
+      node: 324,
+      argp: 110.9,
+      M0: 268,
+      epoch: 2451545
+    },
+    rot: {
+      elon: 168,
+      elat: -86,
+      W0: 0,
+      Wd: 1864.5
+    },
+    shape: {
+      amp: 0.16,
+      freq: 1.8,
+      seed: 45
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.5,
+        0.46,
+        0.42
+      ],
+      tex: 256,
+      craters: 1.1
+    },
+    info: info({
+      type: "Asteroid (Koronis family)",
+      diameter: "60 x 25 x 19 km",
+      day: "4 h 38 min",
+      year: "4.8 years",
+      moons: "1 (Dactyl)",
+      facts: [
+        "Dactyl, 1.4 km across, was the first moon of an asteroid ever found (Galileo, 1993)."
+      ]
+    })
+  },
+  {
+    id: "dactyl",
+    name: "Dactyl",
+    kind: "moon",
+    parent: "ida",
+    R: [
+      0.8,
+      0.7,
+      0.6
+    ],
+    gm: 1e-6,
+    orbit: {
+      a: 108,
+      e: 0,
+      i: 9,
+      node: 0,
+      argp: 0,
+      M0: 0
+    },
+    rot: {
+      locked: true
+    },
+    shape: {
+      amp: 0.1,
+      freq: 1.3,
+      seed: 46
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.5,
+        0.46,
+        0.42
+      ],
+      tex: 128,
+      craters: 0.9
+    },
+    info: info({
+      type: "Moon of Ida",
+      diameter: "1.6 x 1.4 x 1.2 km",
+      facts: [
+        "Orbits Ida about every 37 hours, slower than walking pace."
+      ]
+    })
+  },
+  // ---------------------------------------------------------------------------------------- JUPITER
+  {
+    id: "jupiter",
+    name: "Jupiter",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      71492,
+      66854
+    ],
+    gm: 126686534,
+    orbit: {
+      planet: "jupiter"
+    },
+    rot: {
+      ra: 268.056595,
+      dec: 64.495303,
+      W0: 284.95,
+      Wd: 870.536
+    },
+    look: {
+      ramp: K.GAS,
+      col: [
+        0.82,
+        0.7,
+        0.56
+      ],
+      paint: "jupiter",
+      tex: 1024,
+      minnaert: 0.85,
+      halo: 0.12
+    },
+    atmo: {
+      top: 260,
+      minAlt: 25,
+      P0: 0.5,
+      T: 125,
+      label: "hydrogen and helium above ammonia clouds",
+      comps: [
+        {
+          H: 27,
+          beta: [
+            2e-5,
+            5e-5,
+            12e-5
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0
+        },
+        {
+          H: 32,
+          beta: [
+            34e-4,
+            29e-4,
+            2e-3
+          ],
+          abs: [
+            2e-4,
+            5e-4,
+            11e-4
+          ],
+          g: 0.65
+        }
+      ]
+    },
+    rings: {
+      inner: 92e3,
+      outer: 226e3,
+      faint: true
+    },
+    info: info({
+      type: "Gas giant",
+      diameter: "139,820 km (11 Earths)",
+      mass: "318 Earths",
+      gravity: "24.8 m/s2 at the cloud tops",
+      day: "9 h 56 min",
+      year: "11.9 years",
+      temp: "-110 C at the cloud tops",
+      atmo: "90% hydrogen, 10% helium; ammonia ice clouds",
+      moons: "95 known",
+      facts: [
+        "The Great Red Spot is a storm wider than Earth, watched for over 190 years.",
+        "Clusters of cyclones crowd both poles: eight around the north, five around the south."
+      ]
+    })
+  },
+  {
+    id: "io",
+    name: "Io",
+    kind: "moon",
+    parent: "jupiter",
+    R: [
+      1829.4,
+      1815.7
+    ],
+    gm: 5959.9,
+    orbit: {
+      a: 421800,
+      e: 41e-4,
+      i: 0.036,
+      node: 43.977,
+      argp: 84.129,
+      M0: 342.021
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.86,
+        0.78,
+        0.42
+      ],
+      paint: "io",
+      tex: 512,
+      craters: 0
+    },
+    info: info({
+      type: "Galilean moon of Jupiter",
+      diameter: "3,643 km",
+      gravity: "1.80 m/s2",
+      year: "orbits every 1.77 days",
+      temp: "-130 C (lava lakes 1,200 C)",
+      facts: [
+        "The most volcanic world known: over 400 active volcanoes, squeezed hot by Jupiter's tides.",
+        "Pele's plume rains red sulfur in a ring 1,200 km wide."
+      ]
+    })
+  },
+  {
+    id: "europa",
+    name: "Europa",
+    kind: "moon",
+    parent: "jupiter",
+    R: [
+      1560.8,
+      1560.8
+    ],
+    gm: 3202.7,
+    orbit: {
+      a: 671100,
+      e: 94e-4,
+      i: 0.466,
+      node: 219.106,
+      argp: 88.97,
+      M0: 171.016
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.86,
+        0.8,
+        0.7
+      ],
+      paint: "europa",
+      tex: 512,
+      craters: 0.05
+    },
+    info: info({
+      type: "Galilean moon of Jupiter",
+      diameter: "3,122 km",
+      gravity: "1.31 m/s2",
+      year: "orbits every 3.55 days",
+      temp: "-160 C",
+      facts: [
+        "An ice shell, cracked into reddish lineae, floats on a global salt-water ocean.",
+        "That ocean may hold twice as much water as all of Earth's."
+      ]
+    })
+  },
+  {
+    id: "ganymede",
+    name: "Ganymede",
+    kind: "moon",
+    parent: "jupiter",
+    R: [
+      2631.2,
+      2631.2
+    ],
+    gm: 9887.8,
+    orbit: {
+      a: 1070400,
+      e: 13e-4,
+      i: 0.177,
+      node: 63.552,
+      argp: 192.417,
+      M0: 317.54
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.55,
+        0.52,
+        0.48
+      ],
+      paint: "ganymede",
+      tex: 512
+    },
+    info: info({
+      type: "Galilean moon of Jupiter",
+      diameter: "5,268 km (larger than Mercury)",
+      gravity: "1.43 m/s2",
+      year: "orbits every 7.15 days",
+      facts: [
+        "The largest moon in the Solar System, and the only one with its own magnetic field.",
+        "Dark ancient terrain is cut by bright bands of grooves."
+      ]
+    })
+  },
+  {
+    id: "callisto",
+    name: "Callisto",
+    kind: "moon",
+    parent: "jupiter",
+    R: [
+      2410.3,
+      2410.3
+    ],
+    gm: 7179.3,
+    orbit: {
+      a: 1882700,
+      e: 74e-4,
+      i: 0.192,
+      node: 298.848,
+      argp: 52.643,
+      M0: 181.408
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.36,
+        0.32,
+        0.28
+      ],
+      paint: "callisto",
+      tex: 512
+    },
+    info: info({
+      type: "Galilean moon of Jupiter",
+      diameter: "4,821 km",
+      gravity: "1.24 m/s2",
+      year: "orbits every 16.7 days",
+      facts: [
+        "The most heavily cratered surface known, almost unchanged for four billion years.",
+        "Valhalla's rings spread 3,800 km across."
+      ]
+    })
+  },
+  {
+    id: "amalthea",
+    name: "Amalthea",
+    kind: "moon",
+    parent: "jupiter",
+    R: [
+      125,
+      73,
+      64
+    ],
+    gm: 0.138,
+    orbit: {
+      a: 181366,
+      e: 32e-4,
+      i: 0.374,
+      node: 108.9,
+      argp: 155.9,
+      M0: 185.2
+    },
+    rot: {
+      locked: true
+    },
+    shape: {
+      amp: 0.1,
+      freq: 1.4,
+      seed: 51
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.62,
+        0.36,
+        0.26
+      ],
+      tex: 256,
+      craters: 0.8
+    },
+    info: info({
+      type: "Inner moon of Jupiter",
+      diameter: "250 x 146 x 128 km",
+      year: "orbits every 12 hours",
+      facts: [
+        "The reddest object in the Solar System, dusted by sulfur from Io."
+      ]
+    })
+  },
+  // ----------------------------------------------------------------------------------------- SATURN
+  {
+    id: "saturn",
+    name: "Saturn",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      60268,
+      54364
+    ],
+    gm: 37931187,
+    orbit: {
+      planet: "saturn"
+    },
+    rot: {
+      ra: 40.589,
+      dec: 83.537,
+      W0: 38.9,
+      Wd: 810.7939024
+    },
+    look: {
+      ramp: K.GAS,
+      col: [
+        0.85,
+        0.75,
+        0.55
+      ],
+      paint: "saturn",
+      tex: 1024,
+      minnaert: 0.85,
+      halo: 0.12
+    },
+    atmo: {
+      top: 520,
+      minAlt: 45,
+      P0: 0.5,
+      T: 95,
+      label: "hydrogen and helium, golden ammonia haze",
+      comps: [
+        {
+          H: 60,
+          beta: [
+            1e-5,
+            3e-5,
+            7e-5
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0
+        },
+        {
+          H: 60,
+          beta: [
+            28e-4,
+            24e-4,
+            15e-4
+          ],
+          abs: [
+            2e-4,
+            4e-4,
+            9e-4
+          ],
+          g: 0.65
+        }
+      ]
+    },
+    rings: {
+      inner: 66900,
+      outer: 140300,
+      main: true
+    },
+    info: info({
+      type: "Gas giant",
+      diameter: "116,460 km",
+      mass: "95 Earths",
+      gravity: "10.4 m/s2",
+      day: "10 h 34 min",
+      year: "29.4 years",
+      temp: "-140 C at the cloud tops",
+      atmo: "96% hydrogen, 3% helium",
+      moons: "274 known",
+      facts: [
+        "Its rings span 280,000 km yet are mostly only about 10 m thick.",
+        "A six-sided jet stream circles the north pole, each side wider than Earth.",
+        "Less dense than water."
+      ]
+    })
+  },
+  {
+    id: "mimas",
+    name: "Mimas",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      207.8,
+      196.7,
+      190.6
+    ],
+    gm: 2.503,
+    orbit: {
+      a: 185539,
+      e: 0.0196,
+      i: 1.574,
+      node: 173.027,
+      argp: 332.499,
+      M0: 14.848
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.78,
+        0.77,
+        0.76
+      ],
+      paint: "mimas",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "396 km",
+      year: "orbits every 22.6 hours",
+      facts: [
+        "Herschel crater is 139 km wide, a third of the moon, with a central peak 7 km tall."
+      ]
+    })
+  },
+  {
+    id: "enceladus",
+    name: "Enceladus",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      256.6,
+      251.4,
+      248.3
+    ],
+    gm: 7.211,
+    orbit: {
+      a: 238042,
+      e: 47e-4,
+      i: 3e-3,
+      node: 342.507,
+      argp: 0.076,
+      M0: 199.686
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.95,
+        0.96,
+        0.98
+      ],
+      paint: "enceladus",
+      tex: 512,
+      plume: true
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "504 km",
+      year: "orbits every 1.37 days",
+      temp: "-200 C",
+      facts: [
+        "The most reflective surface in the Solar System.",
+        'Geysers from the "tiger stripes" at its south pole spray ice from an ocean below and feed the E ring.'
+      ]
+    })
+  },
+  {
+    id: "tethys",
+    name: "Tethys",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      538.4,
+      528.3,
+      526.3
+    ],
+    gm: 41.21,
+    orbit: {
+      a: 294672,
+      e: 1e-4,
+      i: 1.091,
+      node: 259.842,
+      argp: 45.202,
+      M0: 243.367
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.85,
+        0.85,
+        0.84
+      ],
+      paint: "tethys",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "1,062 km",
+      year: "orbits every 1.89 days",
+      facts: [
+        "Odysseus crater is 445 km across.",
+        "Ithaca Chasma, a canyon 100 km wide, wraps three quarters of the way around."
+      ]
+    })
+  },
+  {
+    id: "dione",
+    name: "Dione",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      563.4,
+      561.3,
+      559.6
+    ],
+    gm: 73.12,
+    orbit: {
+      a: 377415,
+      e: 22e-4,
+      i: 0.028,
+      node: 290.415,
+      argp: 284.315,
+      M0: 322.232
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.76,
+        0.75,
+        0.73
+      ],
+      paint: "dione",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "1,123 km",
+      year: "orbits every 2.74 days",
+      facts: [
+        'The bright "wispy terrain" on its trailing side is a web of ice cliffs hundreds of metres high.'
+      ]
+    })
+  },
+  {
+    id: "rhea",
+    name: "Rhea",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      765,
+      763.1,
+      762.4
+    ],
+    gm: 153.94,
+    orbit: {
+      a: 527068,
+      e: 2e-4,
+      i: 0.333,
+      node: 351.042,
+      argp: 241.619,
+      M0: 179.781
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.78,
+        0.77,
+        0.75
+      ],
+      paint: "rhea",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "1,527 km",
+      year: "orbits every 4.52 days",
+      facts: [
+        "Saturn's second-largest moon, a cratered ball of ice.",
+        "Bright young Inktomi crater splashes rays across the leading side."
+      ]
+    })
+  },
+  {
+    id: "titan",
+    name: "Titan",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      2574.7,
+      2574.7
+    ],
+    gm: 8978.14,
+    orbit: {
+      a: 1221865,
+      e: 0.0288,
+      i: 0.306,
+      node: 28.06,
+      argp: 180.532,
+      M0: 163.31
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.86,
+        0.6,
+        0.26
+      ],
+      paint: "titan",
+      tex: 512,
+      halo: 0.2,
+      visAlt: 330
+    },
+    atmo: {
+      top: 760,
+      minAlt: 170,
+      P0: 1.47,
+      T: 94,
+      label: "nitrogen with an orange smog of tholins",
+      comps: [
+        {
+          H: 52,
+          beta: [
+            0.36,
+            0.22,
+            0.09
+          ],
+          abs: [
+            0.035,
+            0.11,
+            0.24
+          ],
+          g: 0.62,
+          ms: 0.65
+        },
+        {
+          H: 0,
+          layer: [
+            510,
+            26
+          ],
+          beta: [
+            18e-5,
+            28e-5,
+            5e-4
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0.5
+        }
+      ]
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "5,150 km",
+      gravity: "1.35 m/s2",
+      year: "orbits every 15.9 days",
+      temp: "-180 C",
+      atmo: "nitrogen and methane, 1.5 bar at the surface",
+      facts: [
+        "The only moon with a thick atmosphere: a 1.5 bar nitrogen sky full of orange smog.",
+        "Below the haze lie seas of liquid methane and ethane; you can sink to 170 km before the smog turns opaque.",
+        "Look for the thin blue detached haze layer 500 km up."
+      ]
+    })
+  },
+  {
+    id: "hyperion",
+    name: "Hyperion",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      180,
+      133,
+      103
+    ],
+    gm: 0.3727,
+    orbit: {
+      a: 1500933,
+      e: 0.0232,
+      i: 0.615,
+      node: 263.847,
+      argp: 303.178,
+      M0: 86.342
+    },
+    rot: {
+      tumble: 13
+    },
+    shape: {
+      amp: 0.14,
+      freq: 1.7,
+      seed: 61
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.62,
+        0.56,
+        0.48
+      ],
+      paint: "hyperion",
+      tex: 256
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "360 x 266 x 205 km",
+      year: "orbits every 21.3 days",
+      facts: [
+        "A spongy, porous body that tumbles chaotically: its spin is unpredictable."
+      ]
+    })
+  },
+  {
+    id: "iapetus",
+    name: "Iapetus",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      745.7,
+      745.7,
+      712.1
+    ],
+    gm: 120.51,
+    orbit: {
+      a: 3560854,
+      e: 0.0293,
+      i: 15.47,
+      node: 81.105,
+      argp: 271.606,
+      M0: 201.789
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.7,
+        0.68,
+        0.64
+      ],
+      paint: "iapetus",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Saturn",
+      diameter: "1,469 km",
+      year: "orbits every 79.3 days",
+      facts: [
+        "Two-faced: the leading hemisphere is as dark as coal, the trailing as bright as snow.",
+        "A ridge up to 20 km high runs along its equator, giving it a walnut shape."
+      ]
+    })
+  },
+  {
+    id: "phoebe",
+    name: "Phoebe",
+    kind: "moon",
+    parent: "saturn",
+    R: [
+      109.4,
+      108.5,
+      101.8
+    ],
+    gm: 0.5532,
+    orbit: {
+      a: 12947918,
+      e: 0.1634,
+      i: 175.243,
+      node: 241.086,
+      argp: 342.5,
+      M0: 53.038,
+      plane: "ecliptic"
+    },
+    rot: {
+      ra: 356.9,
+      dec: 77.8,
+      W0: 178.58,
+      Wd: 931.639
+    },
+    shape: {
+      amp: 0.06,
+      freq: 1.4,
+      seed: 62
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.25,
+        0.24,
+        0.23
+      ],
+      tex: 256,
+      craters: 1.2
+    },
+    info: info({
+      type: "Irregular moon of Saturn",
+      diameter: "213 km",
+      year: "retrograde, every 545 days",
+      facts: [
+        "A captured outer-system body; dust from it forms a vast faint ring."
+      ]
+    })
+  },
+  // ----------------------------------------------------------------------------------------- URANUS
+  {
+    id: "uranus",
+    name: "Uranus",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      25559,
+      24973
+    ],
+    gm: 5793939,
+    orbit: {
+      planet: "uranus"
+    },
+    rot: {
+      ra: 257.311,
+      dec: -15.175,
+      W0: 203.81,
+      Wd: -501.1600928
+    },
+    look: {
+      ramp: K.GAS,
+      col: [
+        0.64,
+        0.84,
+        0.88
+      ],
+      paint: "uranus",
+      tex: 512,
+      minnaert: 0.8,
+      halo: 0.15
+    },
+    atmo: {
+      top: 250,
+      minAlt: 25,
+      P0: 0.6,
+      T: 76,
+      label: "hydrogen, helium and methane",
+      comps: [
+        {
+          H: 28,
+          beta: [
+            1e-3,
+            26e-4,
+            6e-3
+          ],
+          abs: [
+            35e-4,
+            8e-4,
+            3e-4
+          ],
+          g: 0
+        },
+        {
+          H: 30,
+          beta: [
+            1e-3,
+            11e-4,
+            11e-4
+          ],
+          abs: [
+            4e-4,
+            1e-4,
+            0
+          ],
+          g: 0.6
+        }
+      ]
+    },
+    rings: {
+      inner: 41800,
+      outer: 103e3,
+      uranian: true
+    },
+    info: info({
+      type: "Ice giant",
+      diameter: "50,724 km",
+      mass: "14.5 Earths",
+      gravity: "8.87 m/s2",
+      day: "17 h 14 min (retrograde)",
+      year: "84 years",
+      temp: "-195 C",
+      atmo: "hydrogen, helium, 2% methane (which makes it blue-green)",
+      moons: "28 known",
+      facts: [
+        "Knocked on its side: tilted 98 degrees, each pole gets 42 years of daylight, then 42 of night.",
+        "Its thin dark rings were found in 1977 when they blinked in front of a star."
+      ]
+    })
+  },
+  {
+    id: "miranda",
+    name: "Miranda",
+    kind: "moon",
+    parent: "uranus",
+    R: [
+      240.4,
+      234.2,
+      232.9
+    ],
+    gm: 4.4,
+    orbit: {
+      a: 129846,
+      e: 13e-4,
+      i: 4.338,
+      node: 326.4,
+      argp: 68.3,
+      M0: 311.3
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.66,
+        0.66,
+        0.66
+      ],
+      paint: "miranda",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Uranus",
+      diameter: "472 km",
+      year: "orbits every 1.41 days",
+      facts: [
+        'A patchwork of giant ovoid "coronae" and the cliff Verona Rupes, up to 20 km tall.'
+      ]
+    })
+  },
+  {
+    id: "ariel",
+    name: "Ariel",
+    kind: "moon",
+    parent: "uranus",
+    R: [
+      581.1,
+      577.9,
+      577.7
+    ],
+    gm: 83.43,
+    orbit: {
+      a: 190929,
+      e: 12e-4,
+      i: 0.041,
+      node: 22.4,
+      argp: 115.3,
+      M0: 39.5
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.7,
+        0.7,
+        0.69
+      ],
+      paint: "ariel",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Uranus",
+      diameter: "1,158 km",
+      year: "orbits every 2.52 days",
+      facts: [
+        "The brightest Uranian moon, crossed by long faulted valleys."
+      ]
+    })
+  },
+  {
+    id: "umbriel",
+    name: "Umbriel",
+    kind: "moon",
+    parent: "uranus",
+    R: [
+      584.7,
+      584.7
+    ],
+    gm: 85.1,
+    orbit: {
+      a: 265986,
+      e: 39e-4,
+      i: 0.128,
+      node: 33.5,
+      argp: 84.7,
+      M0: 12.5
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.36,
+        0.36,
+        0.37
+      ],
+      paint: "umbriel",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Uranus",
+      diameter: "1,169 km",
+      year: "orbits every 4.14 days",
+      facts: [
+        "The darkest of the big Uranian moons, with a mysterious bright ring, Wunda, on its floor."
+      ]
+    })
+  },
+  {
+    id: "titania",
+    name: "Titania",
+    kind: "moon",
+    parent: "uranus",
+    R: [
+      788.4,
+      788.4
+    ],
+    gm: 226.9,
+    orbit: {
+      a: 436298,
+      e: 11e-4,
+      i: 0.079,
+      node: 99.8,
+      argp: 284.4,
+      M0: 24.6
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.6,
+        0.57,
+        0.55
+      ],
+      paint: "titania",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Uranus",
+      diameter: "1,577 km",
+      year: "orbits every 8.71 days",
+      facts: [
+        "The largest moon of Uranus, split by canyons like Messina Chasma, 1,500 km long."
+      ]
+    })
+  },
+  {
+    id: "oberon",
+    name: "Oberon",
+    kind: "moon",
+    parent: "uranus",
+    R: [
+      761.4,
+      761.4
+    ],
+    gm: 205.3,
+    orbit: {
+      a: 583511,
+      e: 14e-4,
+      i: 0.068,
+      node: 279.8,
+      argp: 104.4,
+      M0: 283.1
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.52,
+        0.48,
+        0.46
+      ],
+      paint: "oberon",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Uranus",
+      diameter: "1,523 km",
+      year: "orbits every 13.5 days",
+      facts: [
+        "An old, cratered surface; several craters have dark floors and bright rays."
+      ]
+    })
+  },
+  // ---------------------------------------------------------------------------------------- NEPTUNE
+  {
+    id: "neptune",
+    name: "Neptune",
+    kind: "planet",
+    parent: "sun",
+    R: [
+      24764,
+      24341
+    ],
+    gm: 6836529,
+    orbit: {
+      planet: "neptune"
+    },
+    rot: {
+      ra: 299.36,
+      dec: 43.46,
+      W0: 249.978,
+      Wd: 541.1397757
+    },
+    look: {
+      ramp: K.GAS,
+      col: [
+        0.3,
+        0.5,
+        0.88
+      ],
+      paint: "neptune",
+      tex: 512,
+      minnaert: 0.8,
+      halo: 0.15
+    },
+    atmo: {
+      top: 220,
+      minAlt: 22,
+      P0: 0.6,
+      T: 72,
+      label: "hydrogen, helium and methane",
+      comps: [
+        {
+          H: 20,
+          beta: [
+            14e-4,
+            33e-4,
+            8e-3
+          ],
+          abs: [
+            5e-3,
+            12e-4,
+            2e-4
+          ],
+          g: 0
+        },
+        {
+          H: 22,
+          beta: [
+            8e-4,
+            9e-4,
+            1e-3
+          ],
+          abs: [
+            4e-4,
+            1e-4,
+            0
+          ],
+          g: 0.6
+        }
+      ]
+    },
+    rings: {
+      inner: 40900,
+      outer: 63e3,
+      neptunian: true
+    },
+    info: info({
+      type: "Ice giant",
+      diameter: "49,244 km",
+      mass: "17.1 Earths",
+      gravity: "11.2 m/s2",
+      day: "16 h 6 min",
+      year: "164.8 years",
+      temp: "-200 C",
+      atmo: "hydrogen, helium and methane",
+      moons: "16 known",
+      facts: [
+        "The windiest planet: gusts reach 2,100 km/h.",
+        "Voyager 2 saw a Great Dark Spot here in 1989, trailed by bright methane clouds.",
+        "The Adams ring is clumped into bright arcs."
+      ]
+    })
+  },
+  {
+    id: "proteus",
+    name: "Proteus",
+    kind: "moon",
+    parent: "neptune",
+    R: [
+      210,
+      208,
+      201
+    ],
+    gm: 2.6,
+    orbit: {
+      a: 117647,
+      e: 5e-4,
+      i: 0.524,
+      node: 162.4,
+      argp: 223.7,
+      M0: 279.3
+    },
+    rot: {
+      locked: true
+    },
+    shape: {
+      amp: 0.07,
+      freq: 1.3,
+      seed: 71
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.3,
+        0.3,
+        0.3
+      ],
+      tex: 256,
+      craters: 1
+    },
+    info: info({
+      type: "Moon of Neptune",
+      diameter: "420 km",
+      year: "orbits every 1.12 days",
+      facts: [
+        "About as large as a body can be without gravity pulling it round."
+      ]
+    })
+  },
+  {
+    id: "triton",
+    name: "Triton",
+    kind: "moon",
+    parent: "neptune",
+    R: [
+      1353.4,
+      1353.4
+    ],
+    gm: 1427.6,
+    orbit: {
+      a: 354759,
+      e: 16e-6,
+      i: 156.865,
+      node: 177.608,
+      argp: 66.142,
+      M0: 352.257
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.76,
+        0.7,
+        0.66
+      ],
+      paint: "triton",
+      tex: 512
+    },
+    atmo: {
+      top: 40,
+      minAlt: 4,
+      P0: 14e-6,
+      T: 38,
+      label: "a whisper of nitrogen",
+      comps: [
+        {
+          H: 14,
+          beta: [
+            2e-4,
+            35e-5,
+            7e-4
+          ],
+          abs: [
+            0,
+            0,
+            0
+          ],
+          g: 0.6
+        }
+      ]
+    },
+    info: info({
+      type: "Moon of Neptune",
+      diameter: "2,707 km",
+      year: "orbits every 5.88 days, backwards",
+      temp: "-235 C, among the coldest surfaces known",
+      facts: [
+        "Circles Neptune the wrong way: a captured Kuiper belt world.",
+        "Nitrogen geysers leave dark streaks across its pink southern ice cap."
+      ]
+    })
+  },
+  {
+    id: "nereid",
+    name: "Nereid",
+    kind: "moon",
+    parent: "neptune",
+    R: [
+      178,
+      178
+    ],
+    gm: 2.06,
+    orbit: {
+      a: 5513818,
+      e: 0.7507,
+      i: 7.09,
+      node: 335.6,
+      argp: 296.8,
+      M0: 359.3,
+      plane: "ecliptic"
+    },
+    rot: {
+      ra: 0,
+      dec: 90,
+      W0: 0,
+      Wd: 744.8
+    },
+    look: {
+      ramp: K.ROCK,
+      col: [
+        0.4,
+        0.4,
+        0.4
+      ],
+      tex: 256,
+      craters: 1
+    },
+    info: info({
+      type: "Irregular moon of Neptune",
+      diameter: "357 km",
+      year: "every 360 days on a stretched orbit",
+      facts: [
+        "Its orbit is the most eccentric of any known moon: its distance from Neptune swings sevenfold."
+      ]
+    })
+  },
+  // ------------------------------------------------------------------------------------------ PLUTO
+  {
+    id: "pluto",
+    name: "Pluto",
+    kind: "dwarf",
+    parent: "sun",
+    R: [
+      1188.3,
+      1188.3
+    ],
+    gm: 869.3,
+    orbit: {
+      planet: "pluto",
+      binary: "charon"
+    },
+    rot: {
+      ra: 132.993,
+      dec: -6.163,
+      lockTo: "charon"
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.78,
+        0.66,
+        0.54
+      ],
+      paint: "pluto",
+      tex: 512
+    },
+    atmo: {
+      top: 260,
+      minAlt: 6,
+      P0: 1e-5,
+      T: 44,
+      label: "nitrogen with layered blue haze",
+      comps: [
+        {
+          H: 42,
+          beta: [
+            5e-4,
+            1e-3,
+            24e-4
+          ],
+          abs: [
+            1e-4,
+            1e-4,
+            0
+          ],
+          g: 0.72
+        }
+      ]
+    },
+    info: info({
+      type: "Dwarf planet (Kuiper belt)",
+      diameter: "2,377 km",
+      mass: "0.0022 Earths",
+      gravity: "0.62 m/s2",
+      day: "6.39 days (retrograde)",
+      year: "248 years",
+      temp: "-230 C",
+      atmo: "thin nitrogen, with blue haze layers",
+      moons: "5",
+      facts: [
+        "The bright heart, Tombaugh Regio, holds Sputnik Planitia: a 1,000 km glacier of nitrogen ice, slowly churning.",
+        "Pluto and Charon are locked face to face."
+      ]
+    })
+  },
+  {
+    id: "charon",
+    name: "Charon",
+    kind: "moon",
+    parent: "pluto",
+    R: [
+      606,
+      606
+    ],
+    gm: 105.88,
+    orbit: {
+      binaryOf: "pluto",
+      a: 19591,
+      e: 2e-4,
+      i: 0,
+      node: 0,
+      argp: 0,
+      M0: 0
+    },
+    rot: {
+      locked: true
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.55,
+        0.53,
+        0.52
+      ],
+      paint: "charon",
+      tex: 512
+    },
+    info: info({
+      type: "Moon of Pluto",
+      diameter: "1,212 km (half of Pluto)",
+      year: "orbits every 6.39 days",
+      facts: [
+        "Its reddish north pole, Mordor Macula, is stained by gas escaping from Pluto."
+      ]
+    })
+  },
+  {
+    id: "nix",
+    name: "Nix",
+    kind: "moon",
+    parent: "pluto",
+    R: [
+      25,
+      17,
+      15.5
+    ],
+    gm: 3e-3,
+    orbit: {
+      a: 48694,
+      e: 2e-3,
+      i: 0.13,
+      node: 0,
+      argp: 0,
+      M0: 120
+    },
+    rot: {
+      tumble: 1.83
+    },
+    shape: {
+      amp: 0.1,
+      freq: 1.4,
+      seed: 81
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.75,
+        0.74,
+        0.72
+      ],
+      tex: 128,
+      craters: 0.8
+    },
+    info: info({
+      type: "Moon of Pluto",
+      diameter: "50 x 35 x 33 km",
+      facts: [
+        "Tumbles chaotically in the shifting gravity of the Pluto-Charon pair."
+      ]
+    })
+  },
+  {
+    id: "hydra",
+    name: "Hydra",
+    kind: "moon",
+    parent: "pluto",
+    R: [
+      25.5,
+      18,
+      15.5
+    ],
+    gm: 3e-3,
+    orbit: {
+      a: 64738,
+      e: 59e-4,
+      i: 0.24,
+      node: 0,
+      argp: 0,
+      M0: 240
+    },
+    rot: {
+      tumble: 0.43
+    },
+    shape: {
+      amp: 0.11,
+      freq: 1.5,
+      seed: 82
+    },
+    look: {
+      ramp: K.ICE,
+      col: [
+        0.78,
+        0.78,
+        0.77
+      ],
+      tex: 128,
+      craters: 0.8
+    },
+    info: info({
+      type: "Moon of Pluto",
+      diameter: "51 x 36 x 31 km",
+      facts: [
+        "Coated in almost pure water ice."
+      ]
+    })
+  }
+];
+var BY_ID = Object.fromEntries(BODIES.map((b) => [
+  b.id,
+  b
+]));
+
+// src/system.js
+var MU_MOON = 4902.8 / (398600.4418 + 4902.8);
+var Body = class {
+  constructor(def) {
+    Object.assign(this, def);
+    this.def = def;
+    const R = def.R;
+    this.radii = R.length === 3 ? [
+      R[0],
+      R[1],
+      R[2]
+    ] : [
+      R[0],
+      R[0],
+      R[1]
+    ];
+    this.Req = this.radii[0];
+    this.Rmean = (this.radii[0] + this.radii[1] + this.radii[2]) / 3;
+    this.Rmax = Math.max(...this.radii) * (1 + (def.shape ? def.shape.amp * 1.6 : 0));
+    this.pos = [
+      0,
+      0,
+      0
+    ];
+    this.prev = [
+      0,
+      0,
+      0
+    ];
+    this.vel = [
+      0,
+      0,
+      0
+    ];
+    this.axes = [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ]
+    ];
+    this.children = [];
+    this.toSun = [
+      1,
+      0,
+      0
+    ];
+    this.sunDist = 1;
+    this.atmo = def.atmo || null;
+    this.rings = def.rings || null;
+    this.boundR = Math.max(this.Rmax, this.atmo ? this.Req + this.atmo.top : 0, this.rings ? this.rings.outer : 0);
+    this.minAlt = this.atmo ? this.atmo.minAlt : Math.max(0.15, this.Rmean * 25e-4);
+    this.tex = null;
+  }
+};
+var SolarSystem = class {
+  constructor(jd) {
+    this.jd = jd;
+    this.bodies = BODIES.map((d) => new Body(d));
+    this.byId = Object.fromEntries(this.bodies.map((b) => [
+      b.id,
+      b
+    ]));
+    for (const b of this.bodies) {
+      b.parentBody = b.parent ? this.byId[b.parent] : null;
+      if (b.parentBody) b.parentBody.children.push(b);
+    }
+    this.sun = this.byId.sun;
+    for (const b of this.bodies) this.prepare(b);
+    for (const b of this.bodies) {
+      if (!b.parentBody) {
+        b.soi = Infinity;
+        continue;
+      }
+      const p = b.parentBody;
+      const a = b.orbit.helio ? b.orbit.a * AU : b.orbit.planet ? PLANET_ELEMENTS[b.orbit.planet][0] * AU : b.orbit.emb ? AU : b.orbit.lunar ? 384400 : b.orbit.a;
+      b.soi = Math.max(a * Math.pow(b.gm / p.gm, 0.4), b.boundR * 3, b.Rmax * 8);
+    }
+    this.makeSwarm();
+    this.update(jd);
+    this.update(jd);
+  }
+  prepare(b) {
+    const r = b.rot || {};
+    if (r.ra !== void 0) b.pole = poleBasis(r.ra, r.dec);
+    else if (r.elon !== void 0) {
+      const lo = r.elon * DEG, la = r.elat * DEG;
+      const z = [
+        Math.cos(la) * Math.cos(lo),
+        Math.cos(la) * Math.sin(lo),
+        Math.sin(la)
+      ];
+      const n = norm(cross([
+        0,
+        0,
+        1
+      ], z));
+      b.pole = {
+        z,
+        n,
+        q: cross(z, n)
+      };
+    }
+    if (b.pole) b.spin = (r.Wd || 0) < 0 ? b.pole.z.map((v) => -v) : b.pole.z;
+    const o = b.orbit;
+    if (o && o.a && !o.helio) {
+      const p = b.parentBody;
+      let zr = [
+        0,
+        0,
+        1
+      ];
+      if (o.plane !== "ecliptic" && p.spin) zr = p.spin;
+      let xr = cross([
+        0,
+        0,
+        1
+      ], zr);
+      xr = Math.hypot(...xr) < 1e-6 ? [
+        1,
+        0,
+        0
+      ] : norm(xr);
+      const yr = cross(zr, xr);
+      b.ref = [
+        xr,
+        yr,
+        zr
+      ];
+      const gm = o.binaryOf ? p.gm + b.gm : p.gm + b.gm;
+      b.n = Math.sqrt(gm / (o.a * o.a * o.a)) * 86400;
+    }
+    if (o && o.helio) b.n = Math.sqrt((GM_SUN + b.gm) / Math.pow(o.a * AU, 3)) * 86400;
+  }
+  // Position of body b relative to its parent (or heliocentric for planets), at jd.
+  relPos(b, jd, out) {
+    const o = b.orbit;
+    if (o.planet) return planetPos(o.planet, jd, out);
+    if (o.emb) return planetPos("emb", jd, out);
+    if (o.lunar) return moonGeo(jd, out);
+    if (o.helio) {
+      return orbitXYZ(o.a * AU, o.e, o.i * DEG, o.node * DEG, o.argp * DEG, o.M0 * DEG + b.n * (jd - (o.epoch || J2000)), out);
+    }
+    const t = [
+      0,
+      0,
+      0
+    ];
+    orbitXYZ(o.a, o.e, o.i * DEG, o.node * DEG, o.argp * DEG, o.M0 * DEG + b.n * (jd - J2000), t);
+    const [x, y, z] = b.ref;
+    out[0] = x[0] * t[0] + y[0] * t[1] + z[0] * t[2];
+    out[1] = x[1] * t[0] + y[1] * t[1] + z[1] * t[2];
+    out[2] = x[2] * t[0] + y[2] * t[1] + z[2] * t[2];
+    return out;
+  }
+  update(jd) {
+    const dJd = jd - this.jd;
+    this.jd = jd;
+    const tmp = [
+      0,
+      0,
+      0
+    ], tmp2 = [
+      0,
+      0,
+      0
+    ];
+    for (const b of this.bodies) {
+      b.prev[0] = b.pos[0];
+      b.prev[1] = b.pos[1];
+      b.prev[2] = b.pos[2];
+    }
+    const order = this.order || (this.order = this.bodies.slice().sort((a, b) => this.depth(a) - this.depth(b)));
+    for (const b of order) {
+      const o = b.orbit;
+      if (!o) {
+        b.pos[0] = b.pos[1] = b.pos[2] = 0;
+        continue;
+      }
+      if (o.emb) continue;
+      if (o.lunar) {
+        planetPos("emb", jd, tmp);
+        moonGeo(jd, tmp2);
+        const e = this.byId.earth;
+        for (let k = 0; k < 3; k++) {
+          e.pos[k] = tmp[k] - MU_MOON * tmp2[k];
+          b.pos[k] = tmp[k] + (1 - MU_MOON) * tmp2[k];
+        }
+        continue;
+      }
+      if (o.binary) {
+        planetPos(o.planet, jd, tmp);
+        const c2 = this.byId[o.binary];
+        this.relPos(c2, jd, tmp2);
+        const f = c2.gm / (c2.gm + b.gm);
+        b.bary = b.bary || [
+          0,
+          0,
+          0
+        ];
+        for (let k = 0; k < 3; k++) {
+          b.bary[k] = tmp[k];
+          b.pos[k] = tmp[k] - f * tmp2[k];
+          c2.pos[k] = tmp[k] + (1 - f) * tmp2[k];
+        }
+        continue;
+      }
+      if (o.binaryOf) continue;
+      this.relPos(b, jd, tmp);
+      const p = b.parentBody;
+      const c = p.bary || p.pos;
+      for (let k = 0; k < 3; k++) b.pos[k] = (p.id === "sun" ? 0 : c[k]) + tmp[k];
+    }
+    for (const b of this.bodies) {
+      if (dJd !== 0) for (let k = 0; k < 3; k++) b.vel[k] = (b.pos[k] - b.prev[k]) / (dJd * 86400);
+      const d = Math.hypot(b.pos[0], b.pos[1], b.pos[2]);
+      b.sunDist = d || 1;
+      if (d > 0) {
+        b.toSun[0] = -b.pos[0] / d;
+        b.toSun[1] = -b.pos[1] / d;
+        b.toSun[2] = -b.pos[2] / d;
+      }
+      this.orient(b, jd);
+    }
+    this.updateSwarm(jd);
+  }
+  depth(b) {
+    let d = 0;
+    for (let p = b.parentBody; p; p = p.parentBody) d++;
+    return d;
+  }
+  orient(b, jd) {
+    const r = b.rot || {};
+    const d = jd - J2000;
+    if (r.locked || r.lockTo) {
+      const other = r.lockTo ? this.byId[r.lockTo] : b.parentBody;
+      let x = [
+        other.pos[0] - b.pos[0],
+        other.pos[1] - b.pos[1],
+        other.pos[2] - b.pos[2]
+      ];
+      x = norm(x);
+      let z;
+      if (r.lockTo) z = b.pole.z;
+      else {
+        if (!b.orbNormal || Math.abs(jd - b.normalJd) > 0.25) {
+          const a = [
+            0,
+            0,
+            0
+          ], c = [
+            0,
+            0,
+            0
+          ];
+          if (b.orbit.lunar) {
+            moonGeo(jd, a);
+            moonGeo(jd + 0.01, c);
+          } else {
+            this.relPos(b, jd, a);
+            this.relPos(b, jd + 0.01, c);
+          }
+          b.orbNormal = norm(cross(a, c));
+          b.normalJd = jd;
+        }
+        z = b.orbNormal;
+      }
+      const y = norm(cross(z, x));
+      const x2 = cross(y, z);
+      b.axes[0] = x2;
+      b.axes[1] = y;
+      b.axes[2] = norm(z);
+      return;
+    }
+    if (r.tumble) {
+      const t = d / r.tumble;
+      const ax = norm([
+        Math.sin(t * 0.37 + 1),
+        Math.cos(t * 0.23),
+        0.6 + 0.4 * Math.sin(t * 0.11)
+      ]);
+      const pb = {
+        z: ax,
+        n: norm(cross([
+          0,
+          0,
+          1
+        ], ax))
+      };
+      pb.q = cross(pb.z, pb.n);
+      spinAxes(pb, t * 360, b.axes);
+      return;
+    }
+    if (b.pole) spinAxes(b.pole, (r.W0 || 0) + (r.Wd || 0) * d, b.axes);
+  }
+  // ---- small-body swarm ---------------------------------------------------------------------------
+  makeSwarm() {
+    const rng = new RNG(20261029);
+    const list = [];
+    const J = PLANET_ELEMENTS.jupiter, N = PLANET_ELEMENTS.neptune;
+    const nJ = J[9] / 36525 * DEG, nN = N[9] / 36525 * DEG;
+    const lamJ = J[3] * DEG, lamN = N[3] * DEG;
+    const push = (type, a, e, i, node, argp, M0, n2) => list.push({
+      type,
+      a,
+      e,
+      i,
+      node,
+      argp,
+      M0,
+      n: n2 || Math.sqrt(GM_SUN / Math.pow(a * AU, 3)) * 86400
+    });
+    const gaps = [
+      [
+        2.502,
+        0.035
+      ],
+      [
+        2.825,
+        0.022
+      ],
+      [
+        2.958,
+        0.016
+      ],
+      [
+        3.279,
+        0.05
+      ],
+      [
+        2.065,
+        0.02
+      ]
+    ];
+    let made = 0;
+    while (made < 3600) {
+      const a = 2.1 + Math.pow(rng.next(), 1.15) * 1.25;
+      if (gaps.some(([g, w]) => Math.abs(a - g) < w * (0.6 + rng.next() * 0.6))) continue;
+      const e = clamp(Math.abs(rng.gauss()) * 0.085, 0, 0.33);
+      const i = Math.abs(rng.gauss()) * (rng.chance(0.15) ? 16 : 6.5);
+      push(0, a, e, i * DEG, rng.next() * TAU, rng.next() * TAU, rng.next() * TAU);
+      made++;
+    }
+    for (let k = 0; k < 90; k++) push(0, 1.78 + rng.next() * 0.22, rng.next() * 0.1, (16 + rng.next() * 14) * DEG, rng.next() * TAU, rng.next() * TAU, rng.next() * TAU);
+    const aH = J[0] * Math.pow(2 / 3, 2 / 3);
+    for (let k = 0; k < 280; k++) {
+      const lam = rng.next() * TAU, sigma = rng.gauss() * 0.35;
+      const varpi = 3 * lamJ - 2 * lam - sigma;
+      const node = rng.next() * TAU;
+      push(1, aH, 0.12 + rng.next() * 0.16, Math.abs(rng.gauss()) * 6 * DEG, node, varpi - node, lam - varpi, 1.5 * nJ);
+    }
+    for (let k = 0; k < 700; k++) {
+      const lam = lamJ + (k % 2 ? 1 : -1) * 60 * DEG + rng.gauss() * 0.22;
+      const varpi = rng.next() * TAU, node = rng.next() * TAU;
+      push(2, J[0], Math.abs(rng.gauss()) * 0.06, Math.abs(rng.gauss()) * 12 * DEG, node, varpi - node, lam - varpi, nJ);
+    }
+    for (let k = 0; k < 900; k++) {
+      const hot = rng.chance(0.35);
+      push(3, 42 + rng.next() * 5.5, rng.next() * 0.1, Math.abs(rng.gauss()) * (hot ? 14 : 2.5) * DEG, rng.next() * TAU, rng.next() * TAU, rng.next() * TAU);
+    }
+    const aP = N[0] * Math.pow(3 / 2, 2 / 3);
+    for (let k = 0; k < 320; k++) {
+      const lam = rng.next() * TAU, sigma = Math.PI + rng.gauss() * 0.6;
+      const varpi = 3 * lam - 2 * lamN - sigma;
+      const node = rng.next() * TAU;
+      push(3, aP, 0.1 + rng.next() * 0.2, Math.abs(rng.gauss()) * 10 * DEG, node, varpi - node, lam - varpi, 2 / 3 * nN);
+    }
+    for (let k = 0; k < 180; k++) push(3, 50 + rng.next() * 60, 0.3 + rng.next() * 0.35, Math.abs(rng.gauss()) * 18 * DEG, rng.next() * TAU, rng.next() * TAU, rng.next() * TAU);
+    const n = list.length;
+    this.swarm = {
+      n,
+      list,
+      pos: new Float64Array(n * 3),
+      type: new Uint8Array(n),
+      mag: new Float32Array(n),
+      jd: -1
+    };
+    list.forEach((s, k) => {
+      this.swarm.type[k] = s.type;
+      this.swarm.mag[k] = rng.next();
+    });
+  }
+  updateSwarm(jd) {
+    const s = this.swarm;
+    if (Math.abs(jd - s.jd) < 0.02) return;
+    s.jd = jd;
+    const out = [
+      0,
+      0,
+      0
+    ], dt = jd - J2000;
+    for (let k = 0; k < s.n; k++) {
+      const o = s.list[k];
+      orbitXYZ(o.a * AU, o.e, o.i, o.node, o.argp, o.M0 + o.n * dt, out);
+      s.pos[k * 3] = out[0];
+      s.pos[k * 3 + 1] = out[1];
+      s.pos[k * 3 + 2] = out[2];
+    }
+  }
+  // ---- queries ------------------------------------------------------------------------------------
+  // Deepest body whose sphere of influence holds the heliocentric point p.
+  frameFor(p) {
+    let best = this.sun;
+    const visit = (b) => {
+      for (const c of b.children) {
+        const d = Math.hypot(p[0] - c.pos[0], p[1] - c.pos[1], p[2] - c.pos[2]);
+        if (d < c.soi) {
+          best = c;
+          visit(c);
+          return;
+        }
+      }
+    };
+    visit(this.sun);
+    return best;
+  }
+  // Body whose surface is closest to p, and the altitude above it.
+  nearest(p) {
+    let best = this.sun, alt = Infinity;
+    for (const b of this.bodies) {
+      const d = Math.hypot(p[0] - b.pos[0], p[1] - b.pos[1], p[2] - b.pos[2]) - b.Rmean;
+      if (d < alt) {
+        alt = d;
+        best = b;
+      }
+    }
+    return {
+      body: best,
+      alt
+    };
+  }
+  // Sampled orbit of a body relative to its parent (km), for drawing.
+  orbitPath(b, n = 256) {
+    const pts = new Float64Array(n * 3), t = [
+      0,
+      0,
+      0
+    ];
+    const o = b.orbit;
+    if (!o) return null;
+    let period;
+    if (o.planet || o.emb) {
+      const el = planetElements(o.emb ? "emb" : o.planet, this.jd);
+      for (let k = 0; k < n; k++) {
+        orbitXYZ(el.a, el.e, el.i, el.node, el.argp, k / n * TAU, t);
+        pts.set(t, k * 3);
+      }
+      return pts;
+    }
+    if (o.lunar) period = 27.321661;
+    else period = TAU / b.n;
+    for (let k = 0; k < n; k++) {
+      const jd = this.jd + (k / n - 0.5) * period;
+      if (o.lunar) moonGeo(jd, t);
+      else this.relPos(b, jd, t);
+      pts.set(t, k * 3);
+    }
+    return pts;
+  }
+  // Bodies that can throw a shadow on b (its parent, its siblings and its own moons).
+  occludersFor(b) {
+    if (b.occ) return b.occ;
+    const set = /* @__PURE__ */ new Set();
+    if (b.parentBody && b.parentBody.id !== "sun") {
+      set.add(b.parentBody);
+      for (const s of b.parentBody.children) if (s !== b && s.Rmean > 60) set.add(s);
+    }
+    for (const c of b.children) if (c.Rmean > 60 || b.Rmean < 100) set.add(c);
+    b.occ = [
+      ...set
+    ];
+    return b.occ;
+  }
+};
+
+// src/data/stars.js
+var STAR_COUNT = 6331;
+var STARS_B64 = "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MIkrp648u5A0ha5ikpxZl654gp3QW65IZ566fK40TaRRca5ED61NMq40zKyvca5dubBbQa7/mNS8tq7IpdbKNK4i6vOZva4jHvrJga5kzQANca4uGBKavK470COfva5dSS7lpq4xuzmggq7/mDxkfq7/U0DtcK7IJELwlq7IAEq1Oq4iTHoPhK4154IOoq40sYTHpq5LWoVq4q4fRowfX64xRardza5Lx629665Em8M7n64iOdEBdq7/vtMnoK7/3tedla5frNqexa7/svS7xq4rg/0Ewq43Xg0+P64/MVA09a4dnk70ZK6gnoO2hK4yKacgXq4ulaUB7q4rDrLEZq41RMC2nq5YpcWzPq60zM0LZa40m9Sw064riCdOsK7/5ioiKa4suS9El64vMz80S64xrVBYa64gLVQQpq5dD2E9h64vrWUSkK4y9G4/3a5kNn4fHK428o/jXq4ZiJM1Zq4yV5oOVq6MHcKqrK4f9M4gqq7w6tdYtK5fPQ7R0q9LqREgv680AhfkpK9I/STGxa/IL0N8168f/E0SXa//c1xBbq8suI+Yk6842pDhtK9I47UKlK8fFcJKXq8yP8Sg069i/8n5ha9Ys/hUcq9kv/mU2K8iXvuNrK8sQxLAeq8unxSv4a+MyR/gJK9dtzkrta8srTm4mK8/FT85z69fC0kfT68rL0v4ea//Ok8xja82UFJ/069dtFeLaa83klpkQK//wG7aIK+Md3WtiK9YZHnXva81BYigwK8gk6qhRK8y7Kp0qq9ksK3KOK8+zMnBX68uzstJS68/I80R0q8v69L3r69BGdZoUq8xKuyVT68igyeTUq/IKCro1q8uhTZhya9LqDaEmq84ZDkKha//+UkGbK83C037lq8d+GEwQK/InWa4ia8xUnI94q8udXmRTK8p7oIFr68yYIOTMa8izIQmpq9a76PWO68/Qqs2W68rGaw+mK80pK/N4a9k8biuma8gVMHPva800NAfnK+MX9M5m69dR+N/vq//WPX80K84Z/zGa69Lkf+OJK9iZhlCF68xlTHCbq9fzEJ9bK94AEK3Iq8g90+zp68v9VOkTq9EgVv4OK8x52X4Ya8yEmYaN6//FpJnMq+MEJKfc68iuZQZp68ug5dtg69k68rAwq9TUc5MeK80CN/np68skeZ5ua9YfOgOVK9ffe5bka//agC7Va/c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gF7Kdb1aTGKAK702nYPbpb0vL5RHTb1F1pdukr1CAKJJMb06waO3d70xLaqAlL0xa6xKUL2MLq8utb1YGbqPnL3I87x0S70rUsm7Pb0jI8yQZL3/QNnEor2MHuoskb1fP+u5dr0yTfiuy71B/QX2Vb0vGArZ1b14FQx+nb1dagz1m708swxP27143heDH70i/SeTf70sQS5ryL3/vS/2gb3w3jpTYr1kOkDFT70rFEVeq70/3EQihL0z2ESbf70rxEsHsb00eVWdmL0uPWB1RL3IRGhZQL3/rny1Qr1kIYAkcb00tINL0r0rxoRPUb142IieGb00L4w4c70ugpAmar0xyps6Pr0uzqoJdL1kB7X6N714XbiMUb1Cg7sCcL2MLMR2TL0y2Mu3qL1L59j24b0dmt4reL14s98/v70ywe8EIL1akfX2Vr0uGfgHe71dx/i2eL1Hkf4qhL0sff85z71KSQAS171LrguHnr1kchF00r038h9+fL14NiJ5ib0xMDghkL1kZT7Gp701s0FCa70vBkR3HL0rhVHYsb0y/lFzxL0yJFI1lL0fJGaWd70xh2ZRrL0gxWdaM71k7W94VL14sZetM70r6pjCQr00TZmGTr2MwJyVkL000ac+rr0zSqs37b1dPK9N8L1Lu7Jklr0fc7Zon70uE7cIcb1Ej7dr2b1LjMslrb0j4s/ClL0yCOt90r3/ZvTbaL0vsfdO0b0uHPjR5L1LVvmF1b0uUAT7yb3IIAaDNb1HpAbGXL00iQgbYb14vwx43L14QxFEkb1LRRU5RL0xVyGpD71IZSYUcL01UCdytb2gFidYhL02ry8x973IWzoMS71iFz8rR70jCVqrp70rOWL5Qb2MDWnDJr0xPm/1db0rjHYyG73/4nlnl71Im37zLr1flX8vJ73wKYI2nb0ys5FIj71L9qB7xL1isaffB71fUqybLb14HbKpY71F28loib0yLsqbg714ZM1zlb006tOLo71i1d0GxL0rvuPtob0x7+U3QL0xv/kOrr14wAsBcr5i4A6jtb5fkxG+Yb5a3hWT276MIBido75CiRh/gr48IiXkxr60BjA9lr5LzDEuXb42ajO1rL4vz0GbRr4ge00vw748Tk2LWb4slViUTb4vIVlxY746Zl/h27414mP9Q74ib2/0Mb4u6G/PVb4rLXCsbL54oHDCsb5f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fK3haspkbbGzdspkD7IzXcpLIbV+SspdMLZoxcox3LcXL8oiTbged8oybr5wNMp4zcFul8p4Rsc+2coyLMn3s8q0Lcv2m8oxzMu0i8oZB9AhhMorENJXIsoj0dLLscoygtTX0soz5tfPJcpLWtl3rMov69n6Rcouf+TjGcovkOdlj8rIlOeKxso0oOzNYcpCafmWKsofWfyrPcpQKP3hP8ox8Ql/WMsjKBQcScsxzRRgNstCRxUKIssx5Ba2ZssgRReGt8tiwxrvX8si3BvzrMsy0xzVPcsx6CfDnctkcyiIz8t42CknrMv/fC87PctEvTGAfssybjSjR8suHzcyf8syDj9rOcvwlkAHvcsyvkImc8t4c0oXpctB0EwqVMtQlFV3Msv/a1pWostLf1xtrctEel3kW8tfwWQOV8u0u2WzJssa+2zIKsvcpm+8Ocss4XAJX8tBMHybwstEIn2TJstfjpHQG8suQZT5PMv/W5p6s8sygpxAn8s8XZ3sMMv/5p+eQstElKHSkss2VaKrTMuMDqWeNss6danEkss8paorM8vIbqvDUMtOPrBCWssxDLPvgstddbO3actYu7Xf28s3nbsfNMt4HLwDQ8uMu7vcnctTrrsMtcszLr+az8tLQsYBscvIIclIe8tIu9FTsMtd9dPQs8ssBtn5astkctpgTcuM3+T51Msfb+3HQMs0FvGZsssymPQCU8sujvmrQssuKP+ZUsu08gK4i8s0UwNHvsuMowo4icsgBwvuLss05wx6wMsiphBZEMsyAxlJw8vIahrEU8svex9mhssdCSA7tsuMJyDne8siAiG9z8szUiFtmcv/PycGpMtf8SeQwctTdS/AXctf3DMvjsvIkznEfstBTzkqMMuMyDvcw8tLPUAl+csj8DtAb8tfvju1PMsvkTxlrcsgV0emj8si/UfUG8su5EhQKstB7kv7hst4vUtpScs8v1BoUMtO0VdQTMv/Yllubcs1UV3lYctYMV7RGMtYKmGiMMv/NWLjdctdLWOjIMsvz2WmgstBknEyQ8tYcnTpQ8tk8XQMK8s5ondDOcs0soJVcctEeISJQ8s3dInyestEA42imss02I8EJMtYf5Cgoss08pUWRctYVZfurcssw5dPMsvIUZ3VLMsy5qZQscsyUq85kMs0u7OlSst4prUmLMv/+r01MctOh74lP8s2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";
+
+// src/starfield.js
+var StarField = class {
+  constructor() {
+    const bin = atob(STARS_B64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    const dv = new DataView(u8.buffer);
+    const extra = 7e3;
+    const n = STAR_COUNT + extra;
+    this.n = n;
+    this.x = new Float32Array(n);
+    this.y = new Float32Array(n);
+    this.z = new Float32Array(n);
+    this.mag = new Float32Array(n);
+    this.col = new Float32Array(n * 3);
+    for (let i = 0; i < STAR_COUNT; i++) {
+      const ra = dv.getUint16(i * 6, true) / 65535 * 360;
+      const dec = dv.getUint16(i * 6 + 2, true) / 65535 * 180 - 90;
+      const v = radecToEcl(ra, dec);
+      this.x[i] = v[0];
+      this.y[i] = v[1];
+      this.z[i] = v[2];
+      this.mag[i] = u8[i * 6 + 4] / 25 - 2;
+      const c = blackbody(u8[i * 6 + 5] * 100);
+      this.col.set(c, i * 3);
+    }
+    this.gal = galacticBasis();
+    const rng = new RNG(4242);
+    for (let i = STAR_COUNT; i < n; ) {
+      const z = rng.range(-1, 1), a = rng.range(0, TAU), r = Math.sqrt(1 - z * z);
+      const d = [
+        r * Math.cos(a),
+        r * Math.sin(a),
+        z
+      ];
+      const b = Math.abs(this.gal.z[0] * d[0] + this.gal.z[1] * d[1] + this.gal.z[2] * d[2]);
+      if (rng.next() > 0.25 + 0.75 * Math.exp(-b * b * 30)) continue;
+      this.x[i] = d[0];
+      this.y[i] = d[1];
+      this.z[i] = d[2];
+      this.mag[i] = 6.2 + rng.next() * 1.6;
+      this.col.set(blackbody(rng.range(3200, 11e3)), i * 3);
+      i++;
+    }
+    this.mw = milkyWay(this.gal);
+  }
+};
+function galacticBasis() {
+  const z = radecToEcl(192.85948, 27.12825);
+  let x = radecToEcl(266.40499, -28.93617);
+  const d = x[0] * z[0] + x[1] * z[1] + x[2] * z[2];
+  x = [
+    x[0] - z[0] * d,
+    x[1] - z[1] * d,
+    x[2] - z[2] * d
+  ];
+  const l = Math.hypot(...x);
+  x = x.map((v) => v / l);
+  const y = [
+    z[1] * x[2] - z[2] * x[1],
+    z[2] * x[0] - z[0] * x[2],
+    z[0] * x[1] - z[1] * x[0]
+  ];
+  return {
+    x,
+    y,
+    z
+  };
+}
+function milkyWay(G2) {
+  const W = 512, H = 256;
+  const img = new Float32Array(W * H * 3);
+  const lmc = radecToEcl(80.89, -69.76), smc = radecToEcl(13.19, -72.83), m31 = radecToEcl(10.68, 41.27);
+  for (let y = 0; y < H; y++) {
+    const lat = (90 - (y + 0.5) * 180 / H) * DEG;
+    for (let x = 0; x < W; x++) {
+      const lon = (-180 + (x + 0.5) * 360 / W) * DEG;
+      const d = [
+        Math.cos(lat) * Math.cos(lon),
+        Math.cos(lat) * Math.sin(lon),
+        Math.sin(lat)
+      ];
+      const gx = d[0] * G2.x[0] + d[1] * G2.x[1] + d[2] * G2.x[2];
+      const gy = d[0] * G2.y[0] + d[1] * G2.y[1] + d[2] * G2.y[2];
+      const gz = d[0] * G2.z[0] + d[1] * G2.z[1] + d[2] * G2.z[2];
+      const l = Math.atan2(gy, gx) / DEG, b = Math.asin(clamp(gz, -1, 1)) / DEG;
+      const n = fbm3(d[0] * 6, d[1] * 6, d[2] * 6, 5), n2 = fbm3(d[0] * 18 + 3, d[1] * 18, d[2] * 18, 3);
+      const width = 6 + 5 * Math.exp(-(l * l) / 900) + 2 * n;
+      const disk = Math.exp(-(b * b) / (width * width)) * (0.45 + 0.55 * Math.exp(-(l * l) / 3600));
+      const bulge = 1.2 * Math.exp(-(l * l / 140 + b * b / 70));
+      const rift = Math.exp(-((b - 1.2 - 1.5 * n) * (b - 1.2 - 1.5 * n)) / 3.5) * smoothstep(75, 30, Math.abs(l - 15));
+      let I = (disk + bulge) * (1 - 0.7 * rift) * (0.75 + 0.5 * n + 0.25 * n2);
+      const blob = (c, r) => Math.exp(-(1 - (d[0] * c[0] + d[1] * c[1] + d[2] * c[2])) / (r * r * DEG * DEG * 0.5));
+      I += 0.6 * blob(lmc, 3.5) + 0.35 * blob(smc, 1.8) + 0.25 * blob(m31, 0.9);
+      I = Math.max(0, I) * 0.03;
+      const warm = Math.exp(-(l * l) / 1500);
+      const k = (y * W + x) * 3;
+      img[k] = I * (0.85 + 0.12 * warm);
+      img[k + 1] = I * (0.88 + 0.05 * warm);
+      img[k + 2] = I * (1 - 0.08 * warm);
+    }
+  }
+  return {
+    W,
+    H,
+    img
+  };
+}
+
+// src/data/earth.js
+var EARTH_W = 1024;
+var EARTH_H = 512;
+var EARTH_RLE = "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wWw/Cj8/Pz80fz8/OWw/Pz8pfsJsPwo/Pz8/NH0/PzxpPz8/K0zBccBsPwo/Pz8/NH0/PzxoPz8/LUzAcMFrPws/Pz8/NHw/Pz5nPz8/LX9sPws/Pz8/NHs/Pz9mPz8/Ln9sPws/Pz8/M0SAcwFAPz8/ZT8/Py9/az8MPz8/PzNYwV4/Pz8DZD8/PzB+wETAZD8MPz8/PzNEgHIAQT8/PwFjPz8/MX7BaT8MPz8/PzN3AUA/Pz8DYT8/PzN4wETAaT8MPz8/PzR2Pz8/B14/Pz81ZAhLwELAaj8MPz8/PzR2Pz8/B10/Pz82YQ9HwG0/DT8/Pz80ZABNwEA/Pz8IXD8/PzdbGHI/Dj8/Pz8zc8FAPz8/B1w/Pz84WRpxPw8/Pz8/M3U/Pz8IWj8/PzpXHUcAZj8QPz8/PzN0Pz8/Clg/Pz86Vx9FAWU/ET8/Pz8zcz8/PwtUPz8/PU8DQQBAIUMBZj8RPz8/PzJmAEs/Pz8MQABHPz8/PwhMLEICZT8SPz8/PzJmA0c/Pz8QQj8/Pz8OSC5BA0ABYj8SPz8/PzJoPz8/Pz8/Py5ENUEBYj9AET8/Pz8xaj8/Pz8/Pz8/LGE/AEIPPz8/PzBrPz8/Pz8/Pz8oQANfPwJBDz8/Pz8waz8/Pz8/Pz8/J0AGXT8CQg4/Pz8/MG0/Pz8/Pz8/Py1dPwRADj8/Pz8vbj8/Pz8/Pz8/Llw/BEABQAs/Pz8/L20/Pz8/Pz8/Py5dPwVCCz8/Pz8ubj8/Pz8/Pz8/L1w/BUMKPz8/Py5tPz8/Pz8/Pz8xVwBAPwhDAkIDPz8/Py5sPz8/Pz8/Pz81SAFGPwxJBD8/Pz8uaj8/Pz8/Pz8/O0MDQz8OSQQ/Pz8/LmY/Pz8/Pz8/Pz8JQD8PQsBEBT8/Pz8vXj8/Pz8/Pz8/Pz8eSQc/Pz8/Ll8/Pz8/Pz8/Pz8/H0cIPz8/Py5fPz8/Pz8/Pz8/CUAJQD8MRAg/Pz8/LV8/Pz8/Pz8/Pz8/I0QIPz8/Py1gPz8/Pz8/Pz8/PyJDCT8/Pz8tWAFEPz8/Pz8/Pz8/DEMEQT8DQQVCCj8/Pz8tWD8/Pz8/Pz8/PxRJPwJGAEILPz8/Py1BAFU/Pz8/Pz8/Pz8UST8CRRA/Pz8/LEECVD8/Pz8/Pz8/PxVHPwJGED8/Pz8sQQFBgFMBQD8/Pz8/Pz8/PxFHPwFGET8/Pz8sQAJV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IIECggKCOoMBgASHA40/PxC/v7+eCL+/v7+cGT8/PyCKAII/A4EBhASQPz8Mv7+/ngOAAb+/v7+dGz8/PzCBB4IzhgeQPz6ACb+/v6ICv7+/v54ePz8/GYIegQGEI4MQlT8/A7+/v6UCv7+/v5cAiBw/PxWCPwKRAI0AiQGCC4AAgwiDAIAGmgGAPz6/v7+/v7+/v4kjPz8VhT+BBqwGiwSAAqQ/MYAKv7+/v7+/v7+DAIEnPz8ZhAOGAYAFgQOCIb+xPzKBEL+/v7+/v7++Kj8/CIAJgA2DEYIFgxm/sj8xgAiCAb+/v7+/v7+/gSk/PoEUgBGSBYMcv6gAgj88v7+/v7+/v7+BAoAsPzu/hyG/pT8+v7+/v7+/v7+CMT8wv64Av6o/P7+/v7+/v7+/gDI/JL+/v6E/M7+/v7+/v7+/kjE/GYABgAG/v7+fPzO/v7+/v7+/v5kxPxeCAr+/v5s/Mr+/v7+/v7+/oTA/FoEIv7+/gT8/BL+/v7+/v7+/pTA9gQKFD4AHv7+/gz88v7+/v7+/v7+tLj2TB7+/v5M/L7+/v7+/v7+/sgeIHTy/v7+aBpA/B4Udv7+/v7+/v7+2LD8Hv7+/iQGKPxSOFr+/v7+/v7+/twKBAIMjPwO/v7+NBIwXhC+RFb+/v7+/v7+/sQCLAIEkLYURv7+/jiGGMpIWv7+/v7+/v7+wMyyKF7+/v4gCgBaGAoIulBKGCr+/v7+/v7+/njYxiBu/v7+QDIMFhCuVHIEHv7+/v7+/v7+ZOD8HgQ+/v7+KHYEMgxaWJIARv7+/v7+/v7+MNj8Tv7+/kxmBDIQQlyi/v7+/v7+/v5o8Pxe/v7+RCoEQgQKIDo0nv7+/v7+/v7+tNj8Ov7+/rj8QhgC/v7+/v7+/v7E2LYUOv7+/v4A/Bb+/v7+/v7+/vzU/Cb+/v7o/Ab+/v7+/v7+/v4YxPYAJv7+/uyaQB7+/v7+/v7+/v4suPwy/v7+/ghKYA7+/v7+/v7+/v4oFhCk/B7+/v7+GDr+/v7+/v7+/v7wkFocgv7+/v5EHv7+/v7+/v7+/v4QgHpIDggK/v7+/v7+/v7+/v7+/v6oYK7+/v7+/v7+/v7+/v7+/v4UNK7+/v7+/v7+/v7+/v7+/v5EBlxe/v7+/v7+/v7+/v7+/v7+PsA+/v7+/v7+/v7+/v7+/v76/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/vw==";
+
+// src/paint.js
+var dotp = (p, c) => p[0] * c[0] + p[1] * c[1] + p[2] * c[2];
+var angd = (p, c) => Math.acos(clamp(dotp(p, c), -1, 1)) / DEG;
+var blend = (o, c, w) => {
+  if (w <= 0) return;
+  if (w > 1) w = 1;
+  o.r += (c[0] - o.r) * w;
+  o.g += (c[1] - o.g) * w;
+  o.b += (c[2] - o.b) * w;
+};
+var shade = (o, k) => {
+  o.r *= k;
+  o.g *= k;
+  o.b *= k;
+};
+function craterProfile(d, big) {
+  if (d < 1) {
+    let h = d * d - 1;
+    if (big > 0) {
+      h = Math.max(h, -1 + big * 0.55);
+      h += big * 0.5 * Math.exp(-(d * d) / 0.018);
+    }
+    return h + 0.22 * Math.exp(-((d - 1) * (d - 1)) / 0.012);
+  }
+  const e = d - 1;
+  return 0.22 * Math.exp(-(e * e) / 0.012) + 0.07 * Math.exp(-e * 3.2);
+}
+function craters(p, cell, dens, depthK, seed, o, flat) {
+  const gx = p[0] / cell, gy = p[1] / cell, gz = p[2] / cell;
+  const bx = Math.round(gx) - 1, by = Math.round(gy) - 1, bz = Math.round(gz) - 1;
+  for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) for (let k = 0; k < 2; k++) {
+    const cx = bx + i, cy = by + j, cz = bz + k;
+    const h = hash3(cx + seed * 7919, cy - seed * 131, cz);
+    if ((h & 65535) / 65536 > dens) continue;
+    const h2 = hash3(h, 11, seed), h3 = hash3(h, 23, seed);
+    const ox = cx + (h2 & 65535) / 65536, oy = cy + (h2 >>> 16) / 65536, oz = cz + (h3 & 65535) / 65536;
+    const rc = Math.hypot(ox, oy, oz) * cell;
+    if (Math.abs(rc - 1) > cell * 0.5) continue;
+    const rad = 0.14 + 0.34 * ((h3 >>> 16) / 65536);
+    const dx = gx - ox, dy = gy - oy, dz = gz - oz;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz) / rad;
+    if (d > 2.4) continue;
+    const age = (h >>> 16 & 255) / 255;
+    const rr = rad * cell;
+    const depth = rr * depthK * (0.4 + 0.6 * (1 - age)) / (1 + rr * 22);
+    o.h += craterProfile(d, clamp((rr - 0.012) * 30, 0, 1)) * depth * (1 - flat);
+    if (age < 0.1) o.f += (1 - age / 0.1) * Math.exp(-Math.max(0, d - 0.7) * 2.4) * (1 - flat * 0.6);
+    else if (d < 0.9 && age > 0.7) o.f -= 0.15 * (age - 0.7);
+  }
+}
+function craterField(p, o, cr, flat, startCell = 0.36, oct = 7) {
+  if (!cr || cr.dens <= 0) return;
+  let cell = cr.cell || startCell;
+  for (let k = 0; k < (cr.oct || oct); k++) {
+    craters(p, cell, Math.min(0.97, cr.dens * (0.3 + k * 0.13)), cr.depth || 0.25, (cr.seed || 1) + k * 17, o, flat);
+    cell *= 0.5;
+  }
+}
+function rayPattern(p, f, dist) {
+  const a = dotp(p, f.e1), b = dotp(p, f.e2);
+  const th = Math.atan2(b, a), ca = Math.cos(th), sa = Math.sin(th);
+  const n = f.rays.n || 7;
+  let r = noise3(ca * n, sa * n, f.seed) * 0.65 + noise3(ca * n * 3.1, sa * n * 3.1, f.seed + 9) * 0.35;
+  r = smoothstep(0.08, 0.45, r);
+  return r * Math.exp(-dist / f.rays.len) * smoothstep(f.r * 0.8, f.r * 1.3, dist);
+}
+function pathDist(p, segs) {
+  let best = 180;
+  for (const s of segs) {
+    const pn = dotp(p, s.n);
+    const cx = [
+      s.a[1] * p[2] - s.a[2] * p[1],
+      s.a[2] * p[0] - s.a[0] * p[2],
+      s.a[0] * p[1] - s.a[1] * p[0]
+    ];
+    const cy = [
+      p[1] * s.b[2] - p[2] * s.b[1],
+      p[2] * s.b[0] - p[0] * s.b[2],
+      p[0] * s.b[1] - p[1] * s.b[0]
+    ];
+    let d;
+    if (dotp(cx, s.n) >= 0 && dotp(cy, s.n) >= 0) d = Math.asin(Math.min(1, Math.abs(pn))) / DEG;
+    else d = Math.min(angd(p, s.a), angd(p, s.b));
+    if (d < best) best = d;
+  }
+  return best;
+}
+function cellular(x, y, z, out) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  let f1 = 9, f2 = 9;
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
+    const h = hash3(xi + i, yi + j, zi + k);
+    const h2 = hash3(h, 5, 9);
+    const dx = xi + i + (h & 65535) / 65536 - x, dy = yi + j + (h >>> 16) / 65536 - y, dz = zi + k + (h2 & 65535) / 65536 - z;
+    const d = dx * dx + dy * dy + dz * dz;
+    if (d < f1) {
+      f2 = f1;
+      f1 = d;
+    } else if (d < f2) f2 = d;
+  }
+  out[0] = Math.sqrt(f1);
+  out[1] = Math.sqrt(f2);
+  return out;
+}
+var CELL = [
+  0,
+  0
+];
+function prepFeatures(list, seed = 1) {
+  const rng = new RNG(seed * 7717 + 3);
+  const out = [];
+  for (const f0 of list || []) {
+    const f = {
+      ...f0
+    };
+    if (f.lat !== void 0 && f.lon !== void 0 && f.t !== "ridge") {
+      f.c = fromLatLon(f.lat, f.lon);
+      const t = Math.abs(f.c[2]) < 0.95 ? [
+        0,
+        0,
+        1
+      ] : [
+        1,
+        0,
+        0
+      ];
+      let e1 = [
+        t[1] * f.c[2] - t[2] * f.c[1],
+        t[2] * f.c[0] - t[0] * f.c[2],
+        t[0] * f.c[1] - t[1] * f.c[0]
+      ];
+      const l = Math.hypot(...e1);
+      e1 = e1.map((v) => v / l);
+      f.e1 = e1;
+      f.e2 = [
+        f.c[1] * e1[2] - f.c[2] * e1[1],
+        f.c[2] * e1[0] - f.c[0] * e1[2],
+        f.c[0] * e1[1] - f.c[1] * e1[0]
+      ];
+      f.cosMax = Math.cos(Math.min(179, (f.r || 10) * (f.reach || 2.5) + (f.rays ? f.rays.len * 3 : 0)) * DEG);
+    }
+    f.seed = f.seed || rng.int(1, 9999);
+    if (f.pts) {
+      f.segs = [];
+      for (let i = 0; i + 1 < f.pts.length; i++) {
+        const a = fromLatLon(...f.pts[i]), b = fromLatLon(...f.pts[i + 1]);
+        let n = [
+          a[1] * b[2] - a[2] * b[1],
+          a[2] * b[0] - a[0] * b[2],
+          a[0] * b[1] - a[1] * b[0]
+        ];
+        const l = Math.hypot(...n) || 1;
+        n = n.map((v) => v / l);
+        f.segs.push({
+          a,
+          b,
+          n
+        });
+      }
+    }
+    if (f.t === "lines" || f.t === "spots") {
+      f.items = [];
+      for (let k = 0; k < f.n; k++) {
+        const lat = f.latRange ? rng.range(f.latRange[0], f.latRange[1]) : Math.asin(rng.range(-1, 1)) / DEG;
+        const lon = f.lonRange ? rng.range(f.lonRange[0], f.lonRange[1]) : rng.range(-180, 180);
+        const c = fromLatLon(lat, lon);
+        const ang = rng.range(0, TAU);
+        const e1 = fromLatLon(lat + 90, lon);
+        const e2 = [
+          c[1] * e1[2] - c[2] * e1[1],
+          c[2] * e1[0] - c[0] * e1[2],
+          c[0] * e1[1] - c[1] * e1[0]
+        ];
+        const t = [
+          e1[0] * Math.cos(ang) + e2[0] * Math.sin(ang),
+          e1[1] * Math.cos(ang) + e2[1] * Math.sin(ang),
+          e1[2] * Math.cos(ang) + e2[2] * Math.sin(ang)
+        ];
+        const n = [
+          c[1] * t[2] - c[2] * t[1],
+          c[2] * t[0] - c[0] * t[2],
+          c[0] * t[1] - c[1] * t[0]
+        ];
+        const len2 = f.len ? rng.range(f.len[0], f.len[1]) : 20;
+        const r = f.size ? rng.range(f.size[0], f.size[1]) : 3;
+        f.items.push({
+          c,
+          t,
+          n,
+          len: len2,
+          r,
+          cosMax: Math.cos(Math.min(179, (f.t === "lines" ? len2 : r * 2) + 2) * DEG),
+          k: rng.next(),
+          curve: rng.range(-1, 1)
+        });
+      }
+    }
+    out.push(f);
+  }
+  return out;
+}
+function applyFeatures(p, lat, lon, o, feats, st) {
+  for (const f of feats) {
+    if (f.c && dotp(p, f.c) < f.cosMax) continue;
+    switch (f.t) {
+      case "mare":
+      case "spot": {
+        let d = angd(p, f.c);
+        if (f.rx) {
+          const a = Math.asin(clamp(dotp(p, f.e1), -1, 1)) / DEG, b = Math.asin(clamp(dotp(p, f.e2), -1, 1)) / DEG;
+          d = f.r * Math.hypot(a / f.rx, b / (f.ry || f.r));
+        }
+        if (f.warp) d += f.warp * f.r * (fbm3(p[0] * 4.5 + f.seed, p[1] * 4.5, p[2] * 4.5, 4) * 1.2 + fbm3(p[0] * 17 - f.seed, p[1] * 17, p[2] * 17, 3) * 0.35);
+        const s = f.soft === void 0 ? f.r * 0.2 : f.soft;
+        const w = smoothstep(f.r + s, f.r - s, d) * (f.amt === void 0 ? 1 : f.amt);
+        if (w <= 0) break;
+        if (f.col) blend(o, f.col, w);
+        if (f.h) o.h += f.h * w;
+        if (f.t === "mare") st.flat = Math.max(st.flat, w * (f.flat === void 0 ? 0.8 : f.flat));
+        break;
+      }
+      case "crater": {
+        const dist = angd(p, f.c), d = dist / f.r;
+        if (d < 2.6) {
+          o.h += craterProfile(d, f.big === void 0 ? 1 : f.big) * (f.depth || 4e-3);
+          if (f.floor && d < 0.92) blend(o, f.floor, smoothstep(0.92, 0.8, d) * (f.floorAmt || 1));
+          if (f.rim) blend(o, f.rim, Math.exp(-((d - 1) * (d - 1)) / 0.02) * 0.6);
+          if (f.flatten) st.flat = Math.max(st.flat, smoothstep(1.1, 0.8, d) * f.flatten);
+          if (f.bright) o.f += f.bright * Math.exp(-Math.max(0, d - 0.6) * 1.6);
+          if (f.rings) {
+            const ringy = Math.max(0, Math.sin(d * Math.PI * 2 * f.rings / 2.6)) * smoothstep(2.6, 1, d) * smoothstep(0.6, 1, d);
+            o.h += ringy * (f.depth || 4e-3) * 0.25;
+            if (f.ringCol) blend(o, f.ringCol, ringy * 0.4);
+          }
+        }
+        if (f.rays) o.f += rayPattern(p, f, dist) * f.rays.amt;
+        break;
+      }
+      case "ring": {
+        const d = angd(p, f.c);
+        const w = Math.exp(-((d - f.r) * (d - f.r)) / (f.w * f.w)) * (f.amt || 1) * (1 + (f.warp || 0) * fbm3(p[0] * 9, p[1] * 9, p[2] * 9, 3));
+        blend(o, f.col, w);
+        if (f.h) o.h += f.h * w;
+        break;
+      }
+      case "path": {
+        let d = pathDist(p, f.segs);
+        if (f.warp) d += f.warp * fbm3(p[0] * 14 + f.seed, p[1] * 14, p[2] * 14, 3);
+        const w = smoothstep(f.w, f.w * 0.45, d);
+        if (w > 0) {
+          if (f.col) blend(o, f.col, w * (f.amt || 1));
+          if (f.depth) o.h -= f.depth * w;
+        }
+        if (f.wall && d < f.w * 1.6) o.h -= f.depth * 0.1 * smoothstep(f.w * 1.6, f.w, d);
+        break;
+      }
+      case "volcano": {
+        const d = angd(p, f.c) / f.r;
+        if (d < 1.4) {
+          let h = Math.pow(Math.max(0, 1 - d), 1.3);
+          if (f.scarp) h += 0.18 * smoothstep(1.05, 0.92, d);
+          if (d < f.caldera) h -= 0.12 * smoothstep(f.caldera, f.caldera * 0.7, d);
+          o.h += h * f.h;
+          if (f.col) blend(o, f.col, smoothstep(1.2, 0.6, d) * (f.amt || 0.5));
+        }
+        break;
+      }
+      case "cap": {
+        const pole = f.lat === void 0 ? f.north ? 90 : -90 : f.lat;
+        const d = f.c ? angd(p, f.c) : 90 - (pole > 0 ? lat : -lat);
+        const n = f.warp ? f.warp * fbm3(p[0] * 7 + f.seed, p[1] * 7, p[2] * 7, 4) : 0;
+        const w = smoothstep(f.r + f.soft, f.r - f.soft, d + n) * (f.amt || 1);
+        blend(o, f.col, w);
+        if (f.h) o.h += f.h * w;
+        break;
+      }
+      case "band": {
+        const n = f.warp ? f.warp * fbm3(p[0] * 5 + f.seed, p[1] * 5, p[2] * 5, 3) : 0;
+        const l = lat + n, s = f.soft || 3;
+        const w = smoothstep(f.lat0 - s, f.lat0 + s, l) * smoothstep(f.lat1 + s, f.lat1 - s, l) * (f.amt || 1);
+        blend(o, f.col, w);
+        break;
+      }
+      case "hemi": {
+        const n = f.warp ? f.warp * fbm3(p[0] * 4 + f.seed, p[1] * 4, p[2] * 4, 5) : 0;
+        const d = angd(p, f.c) + n;
+        const w = smoothstep(f.r + f.soft, f.r - f.soft, d) * (f.amt || 1);
+        blend(o, f.col, w);
+        if (f.flat) st.flat = Math.max(st.flat, w * f.flat);
+        if (f.darkFloors) st.darkFloor = Math.max(st.darkFloor, w);
+        break;
+      }
+      case "lines": {
+        for (const L of f.items) {
+          const cd = dotp(p, L.c);
+          if (cd < L.cosMax) continue;
+          const along = Math.atan2(dotp(p, L.t), cd) / DEG;
+          if (Math.abs(along) > L.len) continue;
+          let off = Math.asin(clamp(dotp(p, L.n), -1, 1)) / DEG + L.curve * (along * along) / (L.len * 2.2);
+          if (f.wobble) off += f.wobble * noise3(along * 0.4, L.k * 50, f.seed);
+          const fade = smoothstep(L.len, L.len * 0.7, Math.abs(along));
+          const w = f.w * (0.6 + L.k * 0.8);
+          let s = Math.exp(-(off * off) / (w * w)) * fade;
+          if (f.double) s = s * (1 - 0.8 * Math.exp(-(off * off) / (w * w * 0.12)));
+          blend(o, f.col, s * (f.amt || 1));
+          if (f.h) o.h += f.h * s;
+        }
+        break;
+      }
+      case "spots": {
+        for (const S2 of f.items) {
+          const cd = dotp(p, S2.c);
+          if (cd < S2.cosMax) continue;
+          let d = Math.acos(clamp(cd, -1, 1)) / DEG;
+          if (f.warp) d += f.warp * S2.r * noise3(p[0] * 30, p[1] * 30, p[2] * 30 + S2.k * 10);
+          const w = smoothstep(S2.r * 1.25, S2.r * 0.75, d) * (f.amt || 1);
+          if (w <= 0) continue;
+          const col = f.cols ? f.cols[Math.floor(S2.k * f.cols.length)] : f.col;
+          blend(o, col, w);
+          if (f.glow) o.l = Math.max(o.l, w * f.glow * (S2.k > 0.5 ? 1 : 0.35));
+          if (f.h) o.h += f.h * w;
+        }
+        break;
+      }
+      case "cells": {
+        const d = angd(p, f.c);
+        const w = smoothstep(f.r * 1.05, f.r * 0.85, d + 4 * fbm3(p[0] * 5, p[1] * 5, p[2] * 5, 3));
+        if (w <= 0) break;
+        cellular(p[0] * f.freq, p[1] * f.freq, p[2] * f.freq, CELL);
+        const edge = smoothstep(0.12, 0, CELL[1] - CELL[0]);
+        blend(o, f.col, w);
+        blend(o, f.edge, w * edge * 0.6);
+        o.h -= w * edge * (f.h || 3e-4);
+        st.flat = Math.max(st.flat, w);
+        break;
+      }
+      case "ridge": {
+        const dl = lat - (f.lat || 0);
+        const seg = f.lonSpan ? smoothstep(f.lonSpan + 15, f.lonSpan - 15, Math.abs((lon - f.lon + 540) % 360 - 180)) : 1;
+        const w = Math.exp(-(dl * dl) / (f.w * f.w)) * seg * (0.8 + 0.4 * noise3(lon * 0.15, 3, 5));
+        o.h += f.h * w;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+function rocky(cfg) {
+  const feats = prepFeatures(cfg.features, cfg.seed || 1);
+  const base = cfg.base, tint = cfg.tint || base.map((v) => v * 0.8);
+  const tf = cfg.tintFreq || 2.2, ta = cfg.tintAmp === void 0 ? 0.5 : cfg.tintAmp;
+  const rough = cfg.rough === void 0 ? 0.12 : cfg.rough;
+  const fresh = cfg.fresh || [
+    0.25,
+    0.25,
+    0.24
+  ];
+  const st = {
+    flat: 0,
+    darkFloor: 0
+  };
+  return (p, lat, lon, o) => {
+    const n1 = fbm3(p[0] * tf + 3.1, p[1] * tf, p[2] * tf, 5);
+    o.r = base[0];
+    o.g = base[1];
+    o.b = base[2];
+    blend(o, tint, clamp(0.5 + n1 * 1.3, 0, 1) * ta);
+    const n2 = fbm3(p[0] * 11, p[1] * 11, p[2] * 11, 3);
+    shade(o, 1 + n2 * rough);
+    o.h = n1 * (cfg.undulate || 2e-3) + n2 * 6e-4;
+    o.f = 0;
+    st.flat = cfg.smooth || 0;
+    st.darkFloor = 0;
+    applyFeatures(p, lat, lon, o, feats, st);
+    if (cfg.craterMod) st.flat = Math.max(st.flat, 1 - cfg.craterMod(lat, lon, p));
+    const h0 = o.h;
+    craterField(p, o, cfg.craters, st.flat);
+    if (st.darkFloor > 0 && o.h < h0) blend(o, cfg.darkFloorCol || [
+      0.1,
+      0.08,
+      0.07
+    ], st.darkFloor * smoothstep(0, -2e-3, o.h - h0));
+    if (o.f !== 0) {
+      o.r += o.f * fresh[0];
+      o.g += o.f * fresh[1];
+      o.b += o.f * fresh[2];
+    }
+    if (cfg.post) cfg.post(p, lat, lon, o);
+    o.r = clamp(o.r, 0, 1);
+    o.g = clamp(o.g, 0, 1);
+    o.b = clamp(o.b, 0, 1);
+  };
+}
+function bandColor(table, lat, out) {
+  if (lat >= table[0][0]) {
+    out[0] = table[0][1][0];
+    out[1] = table[0][1][1];
+    out[2] = table[0][1][2];
+    return out;
+  }
+  for (let i = 0; i + 1 < table.length; i++) {
+    const a = table[i], b = table[i + 1];
+    if (lat <= a[0] && lat >= b[0]) {
+      let t = (a[0] - lat) / (a[0] - b[0]);
+      t = t * t * (3 - 2 * t);
+      for (let k = 0; k < 3; k++) out[k] = a[1][k] + (b[1][k] - a[1][k]) * t;
+      return out;
+    }
+  }
+  const l = table[table.length - 1][1];
+  out[0] = l[0];
+  out[1] = l[1];
+  out[2] = l[2];
+  return out;
+}
+var BC = [
+  0,
+  0,
+  0
+];
+function gas(cfg) {
+  const table = cfg.bands.map(([l, c]) => [
+    l,
+    typeof c === "number" ? hex(c) : c
+  ]);
+  const feats = prepFeatures(cfg.features, cfg.seed || 3);
+  const st = {
+    flat: 0,
+    darkFloor: 0
+  };
+  return (p, lat, lon, o) => {
+    const zs = cfg.zStretch || 14;
+    const q1 = fbm3(p[0] * 2.2, p[1] * 2.2, p[2] * zs, 4), q2 = fbm3(p[0] * 2.2 + 5.2, p[1] * 2.2 + 1.3, p[2] * zs + 2.8, 4);
+    const w1 = fbm3(p[0] * 4.4 + q1 * 3.5 + 1.7, p[1] * 4.4 + q2 * 3.5 + 9.2, p[2] * zs * 2, 4);
+    const w2 = fbm3(p[0] * 11 + w1 * 2, p[1] * 11 - q1, p[2] * zs * 4, 3);
+    const turb = cfg.turb(lat) * (cfg.turbK || 1.9);
+    const latW = lat + w1 * turb + q1 * turb * 0.5 + w2 * turb * 0.3;
+    bandColor(table, latW, BC);
+    o.r = BC[0];
+    o.g = BC[1];
+    o.b = BC[2];
+    const s = fbm3(p[0] * 9 + w1 * 2, p[1] * 9, p[2] * zs * 5, 4);
+    shade(o, 1 + s * (cfg.streak || 0.06));
+    const tk = clamp(turb / 7, 0, 1) * (cfg.filament === void 0 ? 1 : cfg.filament);
+    if (tk > 0.02) {
+      const fl = ridged3(p[0] * 5 + w1 * 2.5, p[1] * 5 + q2 * 2.5, p[2] * zs * 2.2, 4);
+      shade(o, 1 + (fl - 0.55) * 0.55 * tk);
+    }
+    o.h = 0;
+    o.f = 0;
+    st.flat = 0;
+    applyFeatures(p, lat, lon, o, feats, st);
+    if (cfg.post) cfg.post(p, lat, lon, o, w1, w2);
+    o.r = clamp(o.r, 0, 1);
+    o.g = clamp(o.g, 0, 1);
+    o.b = clamp(o.b, 0, 1);
+  };
+}
+var EARTH = null;
+function earthData() {
+  if (EARTH) return EARTH;
+  const W = EARTH_W, H = EARTH_H;
+  const bin = atob(EARTH_RLE);
+  const cls = new Uint8Array(W * H);
+  let i = 0;
+  for (let k = 0; k < bin.length; k++) {
+    const b = bin.charCodeAt(k), c = b >> 6, n = (b & 63) + 1;
+    cls.fill(c, i, i + n);
+    i += n;
+  }
+  const D = new Float32Array(W * H).fill(60);
+  const water = (c) => c === 0 || c === 3;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = water(cls[y * W + x]);
+    const r = x + 1 < W ? water(cls[y * W + x + 1]) : a, d = y + 1 < H ? water(cls[(y + 1) * W + x]) : a;
+    if (a !== r || a !== d) D[y * W + x] = 0;
+  }
+  const pass = (dir) => {
+    for (let yy = 0; yy < H; yy++) {
+      const y = dir > 0 ? yy : H - 1 - yy;
+      for (let xx = 0; xx < W; xx++) {
+        const x = dir > 0 ? xx : W - 1 - xx, i0 = y * W + x;
+        let v = D[i0];
+        const xp = x - dir, yp = y - dir;
+        if (xp >= 0 && xp < W) v = Math.min(v, D[y * W + xp] + 1);
+        if (yp >= 0 && yp < H) {
+          v = Math.min(v, D[yp * W + x] + 1);
+          if (xp >= 0 && xp < W) v = Math.min(v, D[yp * W + xp] + 1.414);
+          const xq = x + dir;
+          if (xq >= 0 && xq < W) v = Math.min(v, D[yp * W + xq] + 1.414);
+        }
+        D[i0] = v;
+      }
+    }
+  };
+  pass(1);
+  pass(-1);
+  EARTH = {
+    W,
+    H,
+    cls,
+    D
+  };
+  return EARTH;
+}
+var box = (lat, lon, la0, la1, lo0, lo1, s = 3) => smoothstep(la0 - s, la0 + s, lat) * smoothstep(la1 + s, la1 - s, lat) * smoothstep(lo0 - s, lo0 + s, lon) * smoothstep(lo1 + s, lo1 - s, lon);
+var DESERTS = [
+  [
+    16,
+    31,
+    -17,
+    34,
+    1
+  ],
+  [
+    14,
+    32,
+    34,
+    58,
+    0.95
+  ],
+  [
+    24,
+    37,
+    52,
+    72,
+    0.7
+  ],
+  [
+    36,
+    46,
+    76,
+    108,
+    0.75
+  ],
+  [
+    -28,
+    -17,
+    12,
+    25,
+    0.65
+  ],
+  [
+    -32,
+    -19,
+    116,
+    142,
+    0.9
+  ],
+  [
+    -28,
+    -16,
+    -71.5,
+    -68.5,
+    0.9
+  ],
+  [
+    -50,
+    -38,
+    -71,
+    -64,
+    0.45
+  ],
+  [
+    26,
+    41,
+    -118,
+    -104,
+    0.6
+  ],
+  [
+    2,
+    12,
+    40,
+    51,
+    0.6
+  ],
+  [
+    40,
+    50,
+    48,
+    78,
+    0.4
+  ],
+  [
+    -34,
+    -26,
+    17,
+    22,
+    0.4
+  ],
+  [
+    18,
+    26,
+    -6,
+    8,
+    0.2
+  ]
+];
+var RAINFOREST = [
+  [
+    -12,
+    5,
+    -76,
+    -47
+  ],
+  [
+    -5,
+    5,
+    9,
+    30
+  ],
+  [
+    -9,
+    12,
+    95,
+    152
+  ],
+  [
+    5,
+    18,
+    -92,
+    -78
+  ]
+];
+var MOUNTAINS = [
+  [
+    27,
+    40,
+    70,
+    102,
+    1
+  ],
+  [
+    32,
+    62,
+    -128,
+    -104,
+    0.6
+  ],
+  [
+    44,
+    48,
+    5.5,
+    16,
+    0.7
+  ],
+  [
+    41,
+    44,
+    38,
+    50,
+    0.6
+  ],
+  [
+    5,
+    14,
+    36,
+    42,
+    0.5
+  ],
+  [
+    35,
+    42,
+    25,
+    45,
+    0.4
+  ],
+  [
+    -35,
+    -20,
+    145,
+    152,
+    0.3
+  ],
+  [
+    62,
+    70,
+    -155,
+    -140,
+    0.5
+  ],
+  [
+    47,
+    55,
+    82,
+    100,
+    0.5
+  ]
+];
+var ANDES = prepFeatures([
+  {
+    t: "path",
+    pts: [
+      [
+        10,
+        -73
+      ],
+      [
+        5,
+        -76
+      ],
+      [
+        -2,
+        -78.5
+      ],
+      [
+        -12,
+        -76
+      ],
+      [
+        -18,
+        -69
+      ],
+      [
+        -24,
+        -67.5
+      ],
+      [
+        -33,
+        -70
+      ],
+      [
+        -41,
+        -71.5
+      ],
+      [
+        -50,
+        -73.5
+      ],
+      [
+        -54,
+        -71
+      ]
+    ],
+    w: 3.2
+  }
+]);
+var CITIES = [
+  [
+    40.7,
+    -74,
+    1
+  ],
+  [
+    34.05,
+    -118.25,
+    0.9
+  ],
+  [
+    41.9,
+    -87.6,
+    0.7
+  ],
+  [
+    29.8,
+    -95.4,
+    0.6
+  ],
+  [
+    32.8,
+    -96.8,
+    0.6
+  ],
+  [
+    33.7,
+    -84.4,
+    0.5
+  ],
+  [
+    25.8,
+    -80.2,
+    0.5
+  ],
+  [
+    37.8,
+    -122.3,
+    0.6
+  ],
+  [
+    47.6,
+    -122.3,
+    0.4
+  ],
+  [
+    43.7,
+    -79.4,
+    0.5
+  ],
+  [
+    45.5,
+    -73.6,
+    0.4
+  ],
+  [
+    19.4,
+    -99.1,
+    0.9
+  ],
+  [
+    4.7,
+    -74.1,
+    0.5
+  ],
+  [
+    -12,
+    -77,
+    0.5
+  ],
+  [
+    -33.4,
+    -70.6,
+    0.5
+  ],
+  [
+    -34.6,
+    -58.4,
+    0.7
+  ],
+  [
+    -23.5,
+    -46.6,
+    0.95
+  ],
+  [
+    -22.9,
+    -43.2,
+    0.7
+  ],
+  [
+    51.5,
+    -0.1,
+    0.9
+  ],
+  [
+    48.9,
+    2.35,
+    0.8
+  ],
+  [
+    40.4,
+    -3.7,
+    0.6
+  ],
+  [
+    41.4,
+    2.2,
+    0.4
+  ],
+  [
+    41.9,
+    12.5,
+    0.5
+  ],
+  [
+    45.5,
+    9.2,
+    0.6
+  ],
+  [
+    52.5,
+    13.4,
+    0.5
+  ],
+  [
+    51.4,
+    7,
+    0.7
+  ],
+  [
+    52.4,
+    4.9,
+    0.6
+  ],
+  [
+    55.75,
+    37.6,
+    0.85
+  ],
+  [
+    59.9,
+    30.3,
+    0.45
+  ],
+  [
+    41,
+    29,
+    0.75
+  ],
+  [
+    30,
+    31.2,
+    0.85
+  ],
+  [
+    6.5,
+    3.4,
+    0.6
+  ],
+  [
+    -4.3,
+    15.3,
+    0.4
+  ],
+  [
+    -26.2,
+    28,
+    0.6
+  ],
+  [
+    -1.3,
+    36.8,
+    0.3
+  ],
+  [
+    24.7,
+    46.7,
+    0.5
+  ],
+  [
+    25.2,
+    55.3,
+    0.6
+  ],
+  [
+    35.7,
+    51.4,
+    0.65
+  ],
+  [
+    24.9,
+    67,
+    0.6
+  ],
+  [
+    28.6,
+    77.2,
+    0.95
+  ],
+  [
+    19.1,
+    72.9,
+    0.8
+  ],
+  [
+    22.6,
+    88.4,
+    0.7
+  ],
+  [
+    12.97,
+    77.6,
+    0.6
+  ],
+  [
+    13.1,
+    80.3,
+    0.5
+  ],
+  [
+    23.8,
+    90.4,
+    0.7
+  ],
+  [
+    13.75,
+    100.5,
+    0.7
+  ],
+  [
+    -6.2,
+    106.8,
+    0.85
+  ],
+  [
+    14.6,
+    121,
+    0.7
+  ],
+  [
+    10.8,
+    106.7,
+    0.5
+  ],
+  [
+    1.35,
+    103.8,
+    0.5
+  ],
+  [
+    22.5,
+    114,
+    1
+  ],
+  [
+    31.2,
+    121.5,
+    1
+  ],
+  [
+    39.9,
+    116.4,
+    0.9
+  ],
+  [
+    39.1,
+    117.2,
+    0.5
+  ],
+  [
+    29.6,
+    106.5,
+    0.6
+  ],
+  [
+    30.7,
+    104.1,
+    0.6
+  ],
+  [
+    30.6,
+    114.3,
+    0.6
+  ],
+  [
+    37.6,
+    127,
+    0.9
+  ],
+  [
+    35.7,
+    139.7,
+    1
+  ],
+  [
+    34.7,
+    135.5,
+    0.8
+  ],
+  [
+    35.2,
+    136.9,
+    0.5
+  ],
+  [
+    25,
+    121.5,
+    0.6
+  ],
+  [
+    -33.9,
+    151.2,
+    0.6
+  ],
+  [
+    -37.8,
+    145,
+    0.5
+  ],
+  [
+    -27.5,
+    153,
+    0.3
+  ],
+  [
+    -31.95,
+    115.9,
+    0.3
+  ],
+  [
+    -36.85,
+    174.8,
+    0.3
+  ],
+  [
+    31.5,
+    74.3,
+    0.6
+  ],
+  [
+    33.3,
+    44.4,
+    0.4
+  ],
+  [
+    33.6,
+    -7.6,
+    0.4
+  ],
+  [
+    36.8,
+    3.1,
+    0.4
+  ],
+  [
+    9,
+    38.7,
+    0.3
+  ],
+  [
+    15.6,
+    32.5,
+    0.3
+  ],
+  [
+    50.45,
+    30.5,
+    0.5
+  ],
+  [
+    52.2,
+    21,
+    0.45
+  ],
+  [
+    48.2,
+    16.4,
+    0.4
+  ],
+  [
+    38,
+    23.7,
+    0.4
+  ],
+  [
+    10.5,
+    -66.9,
+    0.4
+  ],
+  [
+    23.1,
+    -82.4,
+    0.3
+  ],
+  [
+    33.4,
+    -112.1,
+    0.45
+  ],
+  [
+    39.7,
+    -105,
+    0.4
+  ],
+  [
+    44.98,
+    -93.3,
+    0.35
+  ],
+  [
+    42.36,
+    -71.06,
+    0.55
+  ],
+  [
+    38.9,
+    -77,
+    0.6
+  ],
+  [
+    39.95,
+    -75.2,
+    0.5
+  ],
+  [
+    42.3,
+    -83,
+    0.45
+  ],
+  [
+    49.3,
+    -123.1,
+    0.3
+  ],
+  [
+    51,
+    -114.1,
+    0.25
+  ],
+  [
+    55,
+    82.9,
+    0.3
+  ],
+  [
+    56.8,
+    60.6,
+    0.3
+  ],
+  [
+    43.2,
+    76.9,
+    0.3
+  ],
+  [
+    41.3,
+    69.2,
+    0.3
+  ],
+  [
+    34,
+    72,
+    0.4
+  ],
+  [
+    26.9,
+    80.9,
+    0.5
+  ],
+  [
+    17.4,
+    78.5,
+    0.5
+  ],
+  [
+    21,
+    105.8,
+    0.5
+  ],
+  [
+    32.1,
+    118.8,
+    0.6
+  ],
+  [
+    36.1,
+    120.4,
+    0.5
+  ],
+  [
+    45.75,
+    126.6,
+    0.4
+  ],
+  [
+    41.8,
+    123.4,
+    0.5
+  ],
+  [
+    3,
+    101.5,
+    0.4
+  ],
+  [
+    -8,
+    112.5,
+    0.6
+  ],
+  [
+    53.5,
+    -2.2,
+    0.6
+  ],
+  [
+    50.1,
+    8.7,
+    0.5
+  ],
+  [
+    48.1,
+    11.6,
+    0.45
+  ],
+  [
+    45.8,
+    4.8,
+    0.35
+  ],
+  [
+    43.3,
+    5.4,
+    0.35
+  ],
+  [
+    38.7,
+    -9.1,
+    0.4
+  ],
+  [
+    37.4,
+    -6,
+    0.3
+  ],
+  [
+    59.3,
+    18.1,
+    0.35
+  ],
+  [
+    60.2,
+    24.9,
+    0.3
+  ],
+  [
+    55.7,
+    12.6,
+    0.3
+  ],
+  [
+    -3.7,
+    -38.5,
+    0.4
+  ],
+  [
+    -8.05,
+    -34.9,
+    0.4
+  ],
+  [
+    -12.97,
+    -38.5,
+    0.4
+  ],
+  [
+    -19.9,
+    -43.9,
+    0.5
+  ],
+  [
+    -30,
+    -51.2,
+    0.4
+  ],
+  [
+    -25.4,
+    -49.3,
+    0.4
+  ],
+  [
+    14.1,
+    -87.2,
+    0.25
+  ],
+  [
+    9,
+    -79.5,
+    0.3
+  ],
+  [
+    18.5,
+    -69.9,
+    0.3
+  ],
+  [
+    -17.8,
+    -63.2,
+    0.3
+  ],
+  [
+    -0.2,
+    -78.5,
+    0.35
+  ],
+  [
+    -2.2,
+    -79.9,
+    0.35
+  ]
+].map(([la, lo, w]) => ({
+  c: fromLatLon(la, lo),
+  w,
+  cos: Math.cos((1.2 + 2.4 * w) * DEG)
+}));
+var LIT_REGIONS = [
+  [
+    35,
+    60,
+    -10,
+    40,
+    0.55
+  ],
+  [
+    25,
+    48,
+    -100,
+    -70,
+    0.5
+  ],
+  [
+    30,
+    50,
+    -125,
+    -115,
+    0.35
+  ],
+  [
+    8,
+    31,
+    70,
+    90,
+    0.5
+  ],
+  [
+    22,
+    41,
+    104,
+    123,
+    0.55
+  ],
+  [
+    31,
+    44,
+    129,
+    143,
+    0.65
+  ],
+  [
+    34,
+    39,
+    126,
+    130,
+    0.6
+  ],
+  [
+    -30,
+    -20,
+    -54,
+    -40,
+    0.35
+  ],
+  [
+    24,
+    31,
+    30,
+    33,
+    0.6
+  ],
+  [
+    22,
+    30,
+    47,
+    57,
+    0.4
+  ],
+  [
+    -8,
+    -6,
+    105,
+    115,
+    0.6
+  ],
+  [
+    45,
+    58,
+    30,
+    60,
+    0.3
+  ],
+  [
+    15,
+    25,
+    -105,
+    -95,
+    0.3
+  ],
+  [
+    -38,
+    -30,
+    140,
+    153,
+    0.25
+  ],
+  [
+    5,
+    14,
+    -10,
+    10,
+    0.2
+  ],
+  [
+    -35,
+    -25,
+    18,
+    32,
+    0.2
+  ]
+];
+var CYCLONES = (() => {
+  const r = new RNG(77);
+  const l = [];
+  for (let k = 0; k < 16; k++) {
+    const south = k % 2 === 1;
+    const lat = (south ? -1 : 1) * r.range(38, 62), lon = r.range(-180, 180);
+    l.push({
+      c: fromLatLon(lat, lon),
+      s: south ? -1 : 1,
+      r: r.range(10, 17),
+      k: r.range(3.5, 5.5)
+    });
+  }
+  for (let k = 0; k < 4; k++) {
+    const lat = (k % 2 ? -1 : 1) * r.range(12, 20);
+    l.push({
+      c: fromLatLon(lat, r.range(-180, 180)),
+      s: lat < 0 ? -1 : 1,
+      r: 4,
+      k: 5
+    });
+  }
+  return l;
+})();
+function earthClouds(p, lat) {
+  let x = p[0], y = p[1], z = p[2];
+  for (const cy of CYCLONES) {
+    const cd = x * cy.c[0] + y * cy.c[1] + z * cy.c[2];
+    const d = Math.acos(clamp(cd, -1, 1)) / DEG;
+    if (d > cy.r) continue;
+    const a = cy.s * cy.k * Math.pow(1 - d / cy.r, 2);
+    const c = Math.cos(a), s = Math.sin(a), k = cy.c;
+    const kd = cd * (1 - c);
+    const nx = x * c + (k[1] * z - k[2] * y) * s + k[0] * kd, ny = y * c + (k[2] * x - k[0] * z) * s + k[1] * kd, nz = z * c + (k[0] * y - k[1] * x) * s + k[2] * kd;
+    x = nx;
+    y = ny;
+    z = nz;
+  }
+  const wx = fbm3(x * 1.6 + 5, y * 1.6, z * 1.6, 3), wy = fbm3(x * 1.6 - 3, y * 1.6 + 7, z * 1.6, 3);
+  const n = fbm3(x * 2.8 + wx * 1.4, y * 2.8 + wy * 1.4, z * 2.8, 6);
+  const al = Math.abs(lat);
+  const itcz = 0.34 * Math.exp(-((lat - 6) * (lat - 6)) / 40);
+  const subtrop = -0.26 * Math.exp(-((al - 24) * (al - 24)) / 70);
+  const mid = 0.22 * smoothstep(32, 52, al) - 0.12 * smoothstep(72, 88, al);
+  const v = n * 0.75 + 0.02 + itcz + subtrop + mid;
+  const puff = itcz > 0.05 ? 0.25 * ridged3(x * 9, y * 9, z * 9, 3) * itcz * 3 : 0;
+  return clamp(smoothstep(0.08, 0.42, v + puff * 0.4), 0, 1);
+}
+function earthPaint(p, lat, lon, o) {
+  const E = earthData();
+  const mx = Math.min(E.W - 1, Math.floor((lon + 180) / 360 * E.W)), my = Math.min(E.H - 1, Math.floor((90 - lat) / 180 * E.H));
+  const cls = E.cls[my * E.W + mx], dc = E.D[my * E.W + mx];
+  const al = Math.abs(lat);
+  const n = fbm3(p[0] * 9, p[1] * 9, p[2] * 9, 4);
+  o.h = 0;
+  o.l = 0;
+  if (cls === 0 || cls === 3) {
+    const shelf = Math.exp(-dc / 2.2) * (cls === 3 ? 0.4 : 1);
+    o.r = 0.018 + shelf * 0.03;
+    o.g = 0.06 + shelf * 0.1 + n * 0.01;
+    o.b = 0.17 + shelf * 0.1 + n * 0.015;
+    if (al < 30) {
+      o.g += 0.015;
+      o.b += 0.02;
+    }
+    o.m = 1;
+    const ice = lat > 0 ? smoothstep(74, 80, lat + n * 5) : smoothstep(64, 70, -lat + n * 4);
+    if (ice > 0.5) {
+      o.r = 0.82 + n * 0.05;
+      o.g = 0.86 + n * 0.05;
+      o.b = 0.92;
+      o.m = 2;
+    }
+  } else if (cls === 2) {
+    const k = 0.88 + n * 0.06;
+    o.r = k * 0.95;
+    o.g = k * 0.97;
+    o.b = k;
+    o.m = 2;
+    o.h = 3e-4 * smoothstep(0, 30, dc) + 8e-5 * n;
+  } else {
+    o.m = 0;
+    let dry = 0;
+    for (const [a0, a1, b0, b1, w] of DESERTS) dry = Math.max(dry, box(lat, lon, a0, a1, b0, b1, 4) * w);
+    dry = clamp(dry + n * 0.25 + smoothstep(25, 55, dc) * 0.2 * smoothstep(30, 50, al) * (al < 55 ? 1 : 0), 0, 1);
+    let wet = 0;
+    for (const [a0, a1, b0, b1] of RAINFOREST) wet = Math.max(wet, box(lat, lon, a0, a1, b0, b1, 3));
+    const boreal = smoothstep(46, 54, al) * smoothstep(70, 62, al);
+    const tundra = smoothstep(60, 70, al);
+    const forest = [
+      0.09,
+      0.19,
+      0.06
+    ], jungle = [
+      0.05,
+      0.16,
+      0.04
+    ], grass = [
+      0.34,
+      0.36,
+      0.17
+    ], tun = [
+      0.33,
+      0.32,
+      0.26
+    ], bor = [
+      0.08,
+      0.15,
+      0.09
+    ];
+    const sand = lon > 110 && lat < -10 ? [
+      0.7,
+      0.42,
+      0.22
+    ] : lat > 14 && lat < 33 && lon > -20 && lon < 60 ? [
+      0.86,
+      0.7,
+      0.46
+    ] : [
+      0.72,
+      0.6,
+      0.42
+    ];
+    o.r = grass[0];
+    o.g = grass[1];
+    o.b = grass[2];
+    blend(o, forest, clamp(0.55 + n * 1.4, 0, 1) * (1 - dry) * smoothstep(60, 40, al));
+    blend(o, jungle, wet * (1 - dry));
+    blend(o, bor, boreal * (0.6 + n));
+    blend(o, tun, tundra);
+    blend(o, sand, smoothstep(0.35, 0.8, dry));
+    let mtn = 0;
+    for (const [a0, a1, b0, b1, w] of MOUNTAINS) mtn = Math.max(mtn, box(lat, lon, a0, a1, b0, b1, 3) * w);
+    const ad = pathDist(p, ANDES[0].segs);
+    mtn = Math.max(mtn, smoothstep(3.2, 0.5, ad) * 0.9);
+    const rg = ridged3(p[0] * 26, p[1] * 26, p[2] * 26, 4);
+    const elev = mtn * (0.4 + rg) + (0.05 + 0.05 * n) * smoothstep(0, 20, dc);
+    o.h = elev * 9e-4;
+    blend(o, [
+      0.38,
+      0.34,
+      0.3
+    ], smoothstep(0.5, 1.1, elev) * 0.7);
+    const snowLine = al > 55 ? 0.5 : al > 35 ? 0.85 : 1.15;
+    blend(o, [
+      0.9,
+      0.92,
+      0.95
+    ], smoothstep(snowLine, snowLine + 0.2, elev + n * 0.1));
+    shade(o, 1 + n * 0.12);
+    let lit = 0;
+    for (const c of CITIES) {
+      const cd = p[0] * c.c[0] + p[1] * c.c[1] + p[2] * c.c[2];
+      if (cd < c.cos) continue;
+      const d = Math.acos(clamp(cd, -1, 1)) / DEG;
+      lit += c.w * Math.exp(-(d * d) / (0.35 + 0.9 * c.w));
+    }
+    let dev = 0;
+    for (const [a0, a1, b0, b1, w] of LIT_REGIONS) dev = Math.max(dev, box(lat, lon, a0, a1, b0, b1, 3) * w);
+    const speck = smoothstep(0.1, 0.55, noise3(p[0] * 140, p[1] * 140, p[2] * 140) + noise3(p[0] * 40, p[1] * 40, p[2] * 40) * 0.5);
+    lit += dev * speck * 0.7 + 0.04 * speck * smoothstep(60, 40, al) * (1 - dry);
+    lit *= 1 - 0.85 * dry * (lit < 0.6 ? 1 : 0.3);
+    o.l = clamp(lit, 0, 1);
+  }
+  o.c = earthClouds(p, lat);
+}
+var PAINTERS = {
+  earth: () => earthPaint,
+  moon: () => rocky({
+    base: [
+      0.64,
+      0.62,
+      0.59
+    ],
+    tint: [
+      0.55,
+      0.53,
+      0.51
+    ],
+    tintAmp: 0.6,
+    rough: 0.1,
+    fresh: [
+      0.32,
+      0.32,
+      0.31
+    ],
+    craters: {
+      dens: 0.95,
+      depth: 0.3,
+      seed: 5
+    },
+    undulate: 3e-3,
+    features: [
+      {
+        t: "mare",
+        lat: 32.8,
+        lon: -15.6,
+        r: 20.1,
+        col: [
+          0.27,
+          0.27,
+          0.27
+        ],
+        warp: 0.22,
+        h: -2e-3
+      },
+      {
+        t: "mare",
+        lat: 18,
+        lon: -57,
+        r: 17.2,
+        col: [
+          0.29,
+          0.29,
+          0.28
+        ],
+        warp: 0.5,
+        h: -1e-3
+      },
+      {
+        t: "mare",
+        lat: 2,
+        lon: -50,
+        r: 12.6,
+        col: [
+          0.29,
+          0.29,
+          0.28
+        ],
+        warp: 0.5,
+        h: -1e-3
+      },
+      {
+        t: "mare",
+        lat: 33,
+        lon: -54,
+        r: 12.6,
+        col: [
+          0.3,
+          0.29,
+          0.28
+        ],
+        warp: 0.5,
+        h: -1e-3
+      },
+      {
+        t: "mare",
+        lat: -6,
+        lon: -40,
+        r: 9.2,
+        col: [
+          0.3,
+          0.3,
+          0.29
+        ],
+        warp: 0.5,
+        h: -1e-3
+      },
+      {
+        t: "mare",
+        lat: 28,
+        lon: 17.5,
+        r: 12.1,
+        col: [
+          0.31,
+          0.29,
+          0.27
+        ],
+        warp: 0.18,
+        h: -2e-3
+      },
+      {
+        t: "mare",
+        lat: 8.5,
+        lon: 31.4,
+        r: 12.6,
+        col: [
+          0.25,
+          0.26,
+          0.29
+        ],
+        warp: 0.4,
+        h: -15e-4
+      },
+      {
+        t: "mare",
+        lat: 1,
+        lon: 23,
+        r: 6.9,
+        col: [
+          0.26,
+          0.27,
+          0.29
+        ],
+        warp: 0.4
+      },
+      {
+        t: "mare",
+        lat: 17,
+        lon: 59.1,
+        r: 9.2,
+        col: [
+          0.27,
+          0.27,
+          0.27
+        ],
+        warp: 0.12,
+        h: -2e-3
+      },
+      {
+        t: "mare",
+        lat: -7.8,
+        lon: 51.3,
+        r: 10.3,
+        col: [
+          0.3,
+          0.29,
+          0.28
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: -15.2,
+        lon: 35.5,
+        r: 6,
+        col: [
+          0.3,
+          0.29,
+          0.28
+        ],
+        warp: 0.3
+      },
+      {
+        t: "mare",
+        lat: -21.3,
+        lon: -16.6,
+        r: 10.9,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: -24.4,
+        lon: -38.6,
+        r: 6.7,
+        col: [
+          0.29,
+          0.29,
+          0.28
+        ],
+        warp: 0.3
+      },
+      {
+        t: "mare",
+        lat: -10,
+        lon: -23,
+        r: 6.3,
+        col: [
+          0.31,
+          0.3,
+          0.29
+        ],
+        warp: 0.4
+      },
+      {
+        t: "mare",
+        lat: 7.5,
+        lon: -30.9,
+        r: 7.5,
+        col: [
+          0.31,
+          0.3,
+          0.29
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: 13.3,
+        lon: 3.6,
+        r: 4.6,
+        col: [
+          0.3,
+          0.3,
+          0.29
+        ],
+        warp: 0.4
+      },
+      {
+        t: "mare",
+        lat: 56,
+        lon: -35,
+        r: 5.8,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: 57,
+        lon: -8,
+        r: 5.8,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: 56,
+        lon: 18,
+        r: 5.8,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: 55,
+        lon: 40,
+        r: 4.6,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.5
+      },
+      {
+        t: "mare",
+        lat: -46.6,
+        lon: 91,
+        r: 9.2,
+        col: [
+          0.36,
+          0.35,
+          0.34
+        ],
+        warp: 0.7,
+        amt: 0.7
+      },
+      {
+        t: "mare",
+        lat: 1.3,
+        lon: 87.5,
+        r: 5.2,
+        col: [
+          0.31,
+          0.3,
+          0.29
+        ],
+        warp: 0.3
+      },
+      {
+        t: "mare",
+        lat: 13.3,
+        lon: 86.1,
+        r: 5.2,
+        col: [
+          0.32,
+          0.31,
+          0.3
+        ],
+        warp: 0.3
+      },
+      {
+        t: "mare",
+        lat: 27.3,
+        lon: 147.9,
+        r: 4,
+        col: [
+          0.3,
+          0.29,
+          0.28
+        ],
+        warp: 0.3
+      },
+      {
+        t: "mare",
+        lat: -33.7,
+        lon: 163.5,
+        r: 4,
+        col: [
+          0.33,
+          0.32,
+          0.31
+        ],
+        warp: 0.6,
+        amt: 0.7
+      },
+      {
+        t: "crater",
+        lat: -19.4,
+        lon: -92.8,
+        r: 5,
+        depth: 6e-3,
+        rings: 3,
+        floor: [
+          0.3,
+          0.3,
+          0.29
+        ],
+        ringCol: [
+          0.5,
+          0.49,
+          0.47
+        ]
+      },
+      {
+        t: "crater",
+        lat: -53,
+        lon: -169,
+        r: 38,
+        depth: 0.012,
+        big: 1,
+        floor: [
+          0.5,
+          0.48,
+          0.46
+        ],
+        floorAmt: 0.5
+      },
+      {
+        t: "crater",
+        lat: -43.31,
+        lon: -11.36,
+        r: 1.45,
+        depth: 35e-4,
+        bright: 0.5,
+        rays: {
+          len: 18,
+          amt: 0.5,
+          n: 9
+        }
+      },
+      {
+        t: "crater",
+        lat: 9.62,
+        lon: -20.08,
+        r: 1.6,
+        depth: 3e-3,
+        bright: 0.35,
+        rays: {
+          len: 9,
+          amt: 0.35,
+          n: 7
+        }
+      },
+      {
+        t: "crater",
+        lat: 8.1,
+        lon: -38,
+        r: 0.6,
+        depth: 15e-4,
+        bright: 0.4,
+        rays: {
+          len: 6,
+          amt: 0.3,
+          n: 6
+        }
+      },
+      {
+        t: "crater",
+        lat: 23.7,
+        lon: -47.4,
+        r: 0.7,
+        depth: 18e-4,
+        bright: 0.8,
+        rays: {
+          len: 4,
+          amt: 0.3,
+          n: 5
+        }
+      },
+      {
+        t: "crater",
+        lat: 16.1,
+        lon: 46.8,
+        r: 0.9,
+        depth: 15e-4,
+        bright: 0.35,
+        rays: {
+          len: 6,
+          amt: 0.3,
+          n: 4
+        }
+      },
+      {
+        t: "crater",
+        lat: 36,
+        lon: 102.9,
+        r: 0.4,
+        depth: 1e-3,
+        bright: 0.5,
+        rays: {
+          len: 6,
+          amt: 0.4,
+          n: 7
+        }
+      },
+      {
+        t: "crater",
+        lat: 22.4,
+        lon: -163.1,
+        r: 1.2,
+        depth: 2e-3,
+        bright: 0.3,
+        rays: {
+          len: 9,
+          amt: 0.3,
+          n: 6
+        }
+      },
+      {
+        t: "crater",
+        lat: -58.4,
+        lon: -14.4,
+        r: 3.7,
+        depth: 3e-3
+      },
+      {
+        t: "crater",
+        lat: -9.3,
+        lon: -1.9,
+        r: 2.5,
+        depth: 2e-3,
+        flatten: 1
+      },
+      {
+        t: "crater",
+        lat: -11.4,
+        lon: 26.4,
+        r: 1.65,
+        depth: 25e-4
+      },
+      {
+        t: "crater",
+        lat: -8.9,
+        lon: 61.1,
+        r: 2.2,
+        depth: 25e-4
+      },
+      {
+        t: "crater",
+        lat: -25.3,
+        lon: 60.4,
+        r: 3,
+        depth: 25e-4
+      },
+      {
+        t: "crater",
+        lat: -44.3,
+        lon: -54.6,
+        r: 3.7,
+        depth: 2e-3,
+        floor: [
+          0.42,
+          0.41,
+          0.4
+        ],
+        floorAmt: 0.5
+      },
+      {
+        t: "crater",
+        lat: 51.6,
+        lon: -9.4,
+        r: 1.65,
+        depth: 15e-4,
+        floor: [
+          0.22,
+          0.22,
+          0.22
+        ],
+        flatten: 1
+      },
+      {
+        t: "crater",
+        lat: -5.2,
+        lon: -68.6,
+        r: 2.8,
+        depth: 2e-3,
+        floor: [
+          0.23,
+          0.23,
+          0.23
+        ],
+        flatten: 1
+      },
+      {
+        t: "crater",
+        lat: -20.4,
+        lon: 129.1,
+        r: 3,
+        depth: 3e-3,
+        floor: [
+          0.24,
+          0.24,
+          0.24
+        ],
+        flatten: 1
+      },
+      {
+        t: "crater",
+        lat: 2.6,
+        lon: -128.4,
+        r: 8.3,
+        depth: 4e-3,
+        rings: 2
+      },
+      {
+        t: "crater",
+        lat: -4.4,
+        lon: -157.4,
+        r: 7.3,
+        depth: 4e-3,
+        rings: 2
+      },
+      {
+        t: "crater",
+        lat: -36.1,
+        lon: -151.8,
+        r: 8,
+        depth: 4e-3
+      }
+    ]
+  }),
+  mercury: () => rocky({
+    base: [
+      0.56,
+      0.53,
+      0.5
+    ],
+    tint: [
+      0.4,
+      0.39,
+      0.38
+    ],
+    tintAmp: 0.65,
+    tintFreq: 3,
+    fresh: [
+      0.35,
+      0.34,
+      0.32
+    ],
+    rough: 0.1,
+    craters: {
+      dens: 0.92,
+      depth: 0.32,
+      seed: 11
+    },
+    undulate: 3e-3,
+    features: [
+      {
+        t: "crater",
+        lat: 30.5,
+        lon: 170.2,
+        r: 18,
+        depth: 4e-3,
+        big: 1,
+        floor: [
+          0.68,
+          0.6,
+          0.5
+        ],
+        floorAmt: 0.6,
+        flatten: 0.8,
+        rings: 2
+      },
+      {
+        t: "spot",
+        lat: 70,
+        lon: 0,
+        r: 24,
+        col: [
+          0.62,
+          0.58,
+          0.53
+        ],
+        warp: 0.6,
+        amt: 0.6
+      },
+      {
+        t: "crater",
+        lat: 57.8,
+        lon: 16.8,
+        r: 1.9,
+        depth: 3e-3,
+        bright: 0.6,
+        rays: {
+          len: 14,
+          amt: 0.4,
+          n: 8
+        }
+      },
+      {
+        t: "crater",
+        lat: -33.9,
+        lon: -12.5,
+        r: 1.9,
+        depth: 3e-3,
+        bright: 0.5,
+        rays: {
+          len: 12,
+          amt: 0.35,
+          n: 7
+        }
+      },
+      {
+        t: "crater",
+        lat: -11.3,
+        lon: -31.5,
+        r: 1.4,
+        depth: 3e-3,
+        bright: 0.6,
+        rays: {
+          len: 10,
+          amt: 0.35,
+          n: 6
+        }
+      },
+      {
+        t: "crater",
+        lat: -2.7,
+        lon: -105,
+        r: 11,
+        depth: 3e-3,
+        floor: [
+          0.42,
+          0.4,
+          0.38
+        ],
+        floorAmt: 0.4,
+        rings: 2
+      }
+    ]
+  }),
+  mars: () => rocky({
+    base: [
+      0.74,
+      0.46,
+      0.27
+    ],
+    tint: [
+      0.56,
+      0.33,
+      0.2
+    ],
+    tintAmp: 0.4,
+    tintFreq: 2.5,
+    rough: 0.1,
+    fresh: [
+      0.12,
+      0.08,
+      0.05
+    ],
+    craters: {
+      dens: 0.85,
+      depth: 0.22,
+      seed: 21
+    },
+    relief: 1.4,
+    undulate: 4e-3,
+    craterMod: (lat, _lon, p) => 0.35 + 0.65 * smoothstep(25, -10, lat + 15 * fbm3(p[0] * 3, p[1] * 3, p[2] * 3, 3)),
+    features: [
+      {
+        t: "spot",
+        lat: 8.4,
+        lon: 69.5,
+        r: 11,
+        rx: 7,
+        ry: 13,
+        col: [
+          0.3,
+          0.2,
+          0.14
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: 46.7,
+        lon: -30,
+        r: 13,
+        col: [
+          0.33,
+          0.21,
+          0.15
+        ],
+        warp: 0.7
+      },
+      {
+        t: "spot",
+        lat: -25,
+        lon: -40,
+        r: 15,
+        col: [
+          0.34,
+          0.22,
+          0.15
+        ],
+        warp: 0.8,
+        amt: 0.8
+      },
+      {
+        t: "spot",
+        lat: -3,
+        lon: 0,
+        r: 6,
+        col: [
+          0.3,
+          0.2,
+          0.14
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: -8,
+        lon: 22,
+        r: 7,
+        col: [
+          0.32,
+          0.21,
+          0.15
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: -20,
+        lon: 105,
+        r: 12,
+        col: [
+          0.34,
+          0.22,
+          0.15
+        ],
+        warp: 0.7,
+        amt: 0.8
+      },
+      {
+        t: "spot",
+        lat: -25,
+        lon: 145,
+        r: 12,
+        col: [
+          0.33,
+          0.21,
+          0.15
+        ],
+        warp: 0.7,
+        amt: 0.85
+      },
+      {
+        t: "spot",
+        lat: -30,
+        lon: -150,
+        r: 12,
+        col: [
+          0.34,
+          0.22,
+          0.16
+        ],
+        warp: 0.7,
+        amt: 0.8
+      },
+      {
+        t: "spot",
+        lat: -26,
+        lon: -85,
+        r: 4.5,
+        col: [
+          0.32,
+          0.21,
+          0.15
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: -15,
+        lon: -50,
+        r: 6,
+        col: [
+          0.34,
+          0.22,
+          0.15
+        ],
+        warp: 0.6,
+        amt: 0.8
+      },
+      {
+        t: "spot",
+        lat: 50,
+        lon: 118,
+        r: 13,
+        col: [
+          0.52,
+          0.34,
+          0.22
+        ],
+        warp: 0.6,
+        amt: 0.6
+      },
+      {
+        t: "spot",
+        lat: 20,
+        lon: 5,
+        r: 18,
+        col: [
+          0.8,
+          0.52,
+          0.32
+        ],
+        warp: 0.5,
+        amt: 0.6
+      },
+      {
+        t: "spot",
+        lat: 5,
+        lon: -115,
+        r: 22,
+        col: [
+          0.8,
+          0.5,
+          0.3
+        ],
+        warp: 0.4,
+        amt: 0.6
+      },
+      {
+        t: "spot",
+        lat: 15,
+        lon: -160,
+        r: 13,
+        col: [
+          0.8,
+          0.52,
+          0.32
+        ],
+        warp: 0.4,
+        amt: 0.6
+      },
+      {
+        t: "spot",
+        lat: 25,
+        lon: 147,
+        r: 10,
+        col: [
+          0.78,
+          0.5,
+          0.3
+        ],
+        warp: 0.4,
+        amt: 0.5
+      },
+      {
+        t: "crater",
+        lat: -42.4,
+        lon: 70.5,
+        r: 19,
+        depth: 55e-4,
+        big: 1,
+        floor: [
+          0.82,
+          0.62,
+          0.46
+        ],
+        floorAmt: 0.6,
+        flatten: 0.8
+      },
+      {
+        t: "crater",
+        lat: -49.7,
+        lon: -43.4,
+        r: 8.5,
+        depth: 4e-3,
+        big: 1,
+        floor: [
+          0.78,
+          0.55,
+          0.38
+        ],
+        floorAmt: 0.5,
+        flatten: 0.7
+      },
+      {
+        t: "crater",
+        lat: 47,
+        lon: 113,
+        r: 25,
+        depth: 2e-3,
+        big: 1
+      },
+      {
+        t: "volcano",
+        lat: 18.65,
+        lon: -133.8,
+        r: 5.2,
+        h: 62e-4,
+        caldera: 0.16,
+        scarp: true,
+        col: [
+          0.72,
+          0.48,
+          0.32
+        ],
+        amt: 0.4
+      },
+      {
+        t: "volcano",
+        lat: 11.92,
+        lon: -104.08,
+        r: 3.1,
+        h: 4e-3,
+        caldera: 0.18,
+        col: [
+          0.72,
+          0.48,
+          0.32
+        ],
+        amt: 0.3
+      },
+      {
+        t: "volcano",
+        lat: 1.48,
+        lon: -112.96,
+        r: 2.7,
+        h: 35e-4,
+        caldera: 0.18,
+        col: [
+          0.72,
+          0.48,
+          0.32
+        ],
+        amt: 0.3
+      },
+      {
+        t: "volcano",
+        lat: -8.26,
+        lon: -120.09,
+        r: 3.6,
+        h: 4e-3,
+        caldera: 0.2,
+        col: [
+          0.72,
+          0.48,
+          0.32
+        ],
+        amt: 0.3
+      },
+      {
+        t: "volcano",
+        lat: 40.5,
+        lon: -109.6,
+        r: 9,
+        h: 18e-4,
+        caldera: 0.08
+      },
+      {
+        t: "volcano",
+        lat: 24.8,
+        lon: 146.9,
+        r: 3,
+        h: 25e-4,
+        caldera: 0.12
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -6.5,
+            -101
+          ],
+          [
+            -9,
+            -88
+          ],
+          [
+            -10,
+            -76
+          ],
+          [
+            -12,
+            -65
+          ],
+          [
+            -12.5,
+            -55
+          ],
+          [
+            -8,
+            -45
+          ],
+          [
+            -4,
+            -38
+          ]
+        ],
+        w: 1.8,
+        depth: 21e-4,
+        col: [
+          0.46,
+          0.3,
+          0.21
+        ],
+        amt: 0.7,
+        warp: 0.5,
+        wall: true
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -5,
+            -106
+          ],
+          [
+            -7,
+            -101
+          ],
+          [
+            -10,
+            -97
+          ]
+        ],
+        w: 2.2,
+        depth: 12e-4,
+        col: [
+          0.5,
+          0.33,
+          0.22
+        ],
+        amt: 0.4,
+        warp: 0.8
+      },
+      {
+        t: "cap",
+        north: true,
+        r: 9.5,
+        soft: 1.5,
+        warp: 2.5,
+        col: [
+          0.95,
+          0.94,
+          0.92
+        ],
+        h: 7e-4
+      },
+      {
+        t: "cap",
+        lat: -87,
+        lon: -45,
+        r: 4.2,
+        soft: 1.2,
+        warp: 1.5,
+        col: [
+          0.95,
+          0.94,
+          0.93
+        ],
+        h: 8e-4,
+        reach: 3
+      }
+    ],
+    post: (p, lat, _lon, o) => {
+      const n = fbm3(p[0] * 3.2 + 11, p[1] * 3.2, p[2] * 3.2, 5) + 0.35 * fbm3(p[0] * 12, p[1] * 12, p[2] * 12, 3);
+      const band2 = smoothstep(-62, -38, lat) * smoothstep(28, 8, lat);
+      blend(o, [
+        0.38,
+        0.24,
+        0.16
+      ], smoothstep(-0.05, 0.25, n) * band2 * 0.8);
+      blend(o, [
+        0.82,
+        0.55,
+        0.34
+      ], smoothstep(-0.05, -0.35, n) * 0.35);
+      if (lat > 78) {
+        const th = Math.atan2(p[1], p[0]), rr = 90 - lat;
+        const s = Math.sin(th * 2 - rr * 0.9 + noise3(p[0] * 20, p[1] * 20, 1) * 1.5);
+        const w = smoothstep(0.75, 0.95, s) * smoothstep(9.5, 7, rr) * smoothstep(1, 2.5, rr);
+        blend(o, [
+          0.6,
+          0.45,
+          0.35
+        ], w * 0.6);
+      }
+    }
+  }),
+  venus: () => (p, lat, lon, o) => {
+    const w = fbm3(p[0] * 2, p[1] * 2, p[2] * 6, 5);
+    const s = fbm3(p[0] * 5 + w, p[1] * 5, p[2] * 18, 4);
+    o.r = 0.92;
+    o.g = 0.84;
+    o.b = 0.64;
+    const lo = (lon + 540) % 360 - 180;
+    const arm = Math.abs(Math.abs(lat) - smoothstep(-20, 100, lo) * 40);
+    const y = Math.exp(-(arm * arm) / 90) * smoothstep(-60, -10, lo) * smoothstep(150, 90, lo);
+    shade(o, 1 - 0.1 * y + 0.05 * w + 0.04 * s);
+    const al = Math.abs(lat);
+    shade(o, 1 + 0.05 * smoothstep(55, 65, al) * smoothstep(75, 66, al) - 0.06 * smoothstep(70, 85, al));
+    o.r += 0.03 * (1 - al / 90);
+    o.h = 0;
+    o.m = 0;
+  },
+  jupiter: () => gas({
+    zStretch: 16,
+    streak: 0.07,
+    seed: 8,
+    bands: [
+      [
+        90,
+        9078657
+      ],
+      [
+        72,
+        9276035
+      ],
+      [
+        62,
+        10064255
+      ],
+      [
+        52,
+        10721414
+      ],
+      [
+        47,
+        11971218
+      ],
+      [
+        43,
+        13089181
+      ],
+      [
+        39,
+        11112823
+      ],
+      [
+        35,
+        13616040
+      ],
+      [
+        31,
+        14142899
+      ],
+      [
+        28.5,
+        11767922
+      ],
+      [
+        25,
+        11109478
+      ],
+      [
+        22.5,
+        14865852
+      ],
+      [
+        19,
+        15129024
+      ],
+      [
+        17,
+        10777686
+      ],
+      [
+        14,
+        9263678
+      ],
+      [
+        10,
+        9724746
+      ],
+      [
+        7.5,
+        11569780
+      ],
+      [
+        5.5,
+        15656143
+      ],
+      [
+        0,
+        15260610
+      ],
+      [
+        -5,
+        15524040
+      ],
+      [
+        -7.5,
+        11635306
+      ],
+      [
+        -10,
+        10185805
+      ],
+      [
+        -14,
+        11042140
+      ],
+      [
+        -18,
+        9659978
+      ],
+      [
+        -20,
+        14074790
+      ],
+      [
+        -23,
+        15129023
+      ],
+      [
+        -26.5,
+        14734264
+      ],
+      [
+        -28.5,
+        11111020
+      ],
+      [
+        -32,
+        11769464
+      ],
+      [
+        -35,
+        14274229
+      ],
+      [
+        -39,
+        13286304
+      ],
+      [
+        -42,
+        11245436
+      ],
+      [
+        -46,
+        12957596
+      ],
+      [
+        -53,
+        10786692
+      ],
+      [
+        -62,
+        9801088
+      ],
+      [
+        -72,
+        9275778
+      ],
+      [
+        -90,
+        8881536
+      ]
+    ],
+    turb: (lat) => {
+      const a = Math.abs(lat);
+      return 1.1 + 2.4 * Math.exp(-((a - 8) * (a - 8)) / 6) + 1.6 * Math.exp(-((a - 18) * (a - 18)) / 8) + (a > 45 ? 2.5 : 0) + 0.8 * Math.exp(-((a - 27) * (a - 27)) / 8);
+    },
+    features: [
+      // NEB brown barges and the white ovals of the southern temperate belts
+      {
+        t: "spots",
+        n: 7,
+        size: [
+          0.7,
+          1.3
+        ],
+        latRange: [
+          14,
+          16
+        ],
+        col: [
+          0.45,
+          0.25,
+          0.16
+        ],
+        amt: 0.7,
+        warp: 0.3
+      },
+      {
+        t: "spots",
+        n: 9,
+        size: [
+          0.8,
+          1.5
+        ],
+        latRange: [
+          -42,
+          -39
+        ],
+        col: [
+          0.93,
+          0.9,
+          0.84
+        ],
+        amt: 0.85,
+        warp: 0.25
+      },
+      {
+        t: "spots",
+        n: 6,
+        size: [
+          0.5,
+          1
+        ],
+        latRange: [
+          -49,
+          -46
+        ],
+        col: [
+          0.9,
+          0.87,
+          0.8
+        ],
+        amt: 0.7,
+        warp: 0.3
+      },
+      {
+        t: "spots",
+        n: 5,
+        size: [
+          0.6,
+          1.2
+        ],
+        latRange: [
+          40,
+          42
+        ],
+        col: [
+          0.92,
+          0.88,
+          0.82
+        ],
+        amt: 0.6,
+        warp: 0.3
+      }
+    ],
+    post: (p, lat, lon, o, w1) => {
+      if (lat > -2 && lat < 9) {
+        const ph = (lon * 13 / 360 + w1 * 0.3) % 1;
+        const f = ph < 0 ? ph + 1 : ph;
+        const tail = (9 - lat) / 9;
+        const d = Math.abs(f - 0.5 - tail * 0.35);
+        const w = smoothstep(0.08, 0, d - tail * 0.02) * smoothstep(-2, 3, lat) * smoothstep(9, 6.5, lat);
+        blend(o, [
+          0.42,
+          0.42,
+          0.46
+        ], w * 0.7);
+      }
+      if (Math.abs(lat) < 6) {
+        const n = fbm3(p[0] * 14, p[1] * 14, p[2] * 40, 3);
+        shade(o, 1 + Math.max(0, n) * 0.12);
+      }
+    }
+  }),
+  saturn: () => gas({
+    zStretch: 22,
+    streak: 0.04,
+    seed: 9,
+    bands: [
+      [
+        90,
+        7305852
+      ],
+      [
+        86,
+        8226692
+      ],
+      [
+        81,
+        10132104
+      ],
+      [
+        77,
+        11118223
+      ],
+      [
+        72,
+        12365448
+      ],
+      [
+        66,
+        13219725
+      ],
+      [
+        60,
+        12166268
+      ],
+      [
+        55,
+        13811346
+      ],
+      [
+        48,
+        14206103
+      ],
+      [
+        46.5,
+        11113588
+      ],
+      [
+        44,
+        14469276
+      ],
+      [
+        37,
+        14008469
+      ],
+      [
+        31,
+        14667169
+      ],
+      [
+        24,
+        13810831
+      ],
+      [
+        18,
+        14930599
+      ],
+      [
+        12,
+        15391150
+      ],
+      [
+        5,
+        15654838
+      ],
+      [
+        -5,
+        15522994
+      ],
+      [
+        -12,
+        14732706
+      ],
+      [
+        -20,
+        13679244
+      ],
+      [
+        -27,
+        14403483
+      ],
+      [
+        -34,
+        13284489
+      ],
+      [
+        -42,
+        13877140
+      ],
+      [
+        -52,
+        12627335
+      ],
+      [
+        -62,
+        11904389
+      ],
+      [
+        -72,
+        10984838
+      ],
+      [
+        -82,
+        10196358
+      ],
+      [
+        -90,
+        9736068
+      ]
+    ],
+    turb: (lat) => 0.5 + 0.8 * Math.exp(-((Math.abs(lat) - 40) * (Math.abs(lat) - 40)) / 60),
+    post: (p, lat, lon, o) => {
+      const rib = lat - (47 + 0.9 * Math.sin(lon * 12 * Math.PI / 180 + noise3(p[0] * 6, p[1] * 6, 3) * 1.5));
+      blend(o, [
+        0.6,
+        0.52,
+        0.4
+      ], Math.exp(-(rib * rib) / 0.25) * 0.5);
+    }
+  }),
+  uranus: () => gas({
+    zStretch: 10,
+    streak: 0.02,
+    seed: 10,
+    bands: [
+      [
+        90,
+        [
+          0.78,
+          0.92,
+          0.92
+        ]
+      ],
+      [
+        70,
+        [
+          0.74,
+          0.9,
+          0.91
+        ]
+      ],
+      [
+        55,
+        [
+          0.66,
+          0.85,
+          0.88
+        ]
+      ],
+      [
+        40,
+        [
+          0.62,
+          0.83,
+          0.87
+        ]
+      ],
+      [
+        20,
+        [
+          0.6,
+          0.82,
+          0.86
+        ]
+      ],
+      [
+        0,
+        [
+          0.6,
+          0.81,
+          0.86
+        ]
+      ],
+      [
+        -20,
+        [
+          0.6,
+          0.8,
+          0.85
+        ]
+      ],
+      [
+        -40,
+        [
+          0.63,
+          0.82,
+          0.86
+        ]
+      ],
+      [
+        -48,
+        [
+          0.7,
+          0.86,
+          0.88
+        ]
+      ],
+      [
+        -60,
+        [
+          0.62,
+          0.8,
+          0.85
+        ]
+      ],
+      [
+        -90,
+        [
+          0.6,
+          0.78,
+          0.84
+        ]
+      ]
+    ],
+    turb: () => 1.5,
+    features: [
+      {
+        t: "spots",
+        n: 6,
+        size: [
+          0.6,
+          1.4
+        ],
+        latRange: [
+          25,
+          45
+        ],
+        col: [
+          0.9,
+          0.97,
+          0.97
+        ],
+        amt: 0.7,
+        warp: 0.5
+      }
+    ]
+  }),
+  neptune: () => gas({
+    zStretch: 12,
+    streak: 0.05,
+    seed: 12,
+    bands: [
+      [
+        90,
+        [
+          0.28,
+          0.44,
+          0.78
+        ]
+      ],
+      [
+        65,
+        [
+          0.3,
+          0.48,
+          0.82
+        ]
+      ],
+      [
+        45,
+        [
+          0.28,
+          0.47,
+          0.84
+        ]
+      ],
+      [
+        25,
+        [
+          0.3,
+          0.5,
+          0.86
+        ]
+      ],
+      [
+        5,
+        [
+          0.33,
+          0.53,
+          0.88
+        ]
+      ],
+      [
+        -10,
+        [
+          0.3,
+          0.5,
+          0.87
+        ]
+      ],
+      [
+        -30,
+        [
+          0.27,
+          0.46,
+          0.85
+        ]
+      ],
+      [
+        -50,
+        [
+          0.22,
+          0.38,
+          0.75
+        ]
+      ],
+      [
+        -62,
+        [
+          0.25,
+          0.42,
+          0.8
+        ]
+      ],
+      [
+        -75,
+        [
+          0.31,
+          0.5,
+          0.84
+        ]
+      ],
+      [
+        -90,
+        [
+          0.33,
+          0.52,
+          0.85
+        ]
+      ]
+    ],
+    turb: () => 2.5,
+    features: [
+      {
+        t: "lines",
+        n: 14,
+        w: 0.5,
+        len: [
+          8,
+          30
+        ],
+        latRange: [
+          -46,
+          -26
+        ],
+        col: [
+          0.85,
+          0.9,
+          0.98
+        ],
+        amt: 0.85,
+        wobble: 0.6
+      },
+      {
+        t: "lines",
+        n: 8,
+        w: 0.4,
+        len: [
+          6,
+          18
+        ],
+        latRange: [
+          22,
+          38
+        ],
+        col: [
+          0.85,
+          0.9,
+          0.98
+        ],
+        amt: 0.7,
+        wobble: 0.5
+      }
+    ]
+  }),
+  io: () => rocky({
+    base: [
+      0.88,
+      0.8,
+      0.44
+    ],
+    tint: [
+      0.9,
+      0.88,
+      0.72
+    ],
+    tintAmp: 0.6,
+    tintFreq: 3.5,
+    rough: 0.12,
+    craters: null,
+    features: [
+      {
+        t: "cap",
+        north: true,
+        r: 32,
+        soft: 10,
+        warp: 8,
+        col: [
+          0.55,
+          0.4,
+          0.28
+        ],
+        amt: 0.75
+      },
+      {
+        t: "cap",
+        north: false,
+        r: 30,
+        soft: 10,
+        warp: 8,
+        col: [
+          0.52,
+          0.38,
+          0.27
+        ],
+        amt: 0.75
+      },
+      {
+        t: "spots",
+        n: 24,
+        size: [
+          2,
+          7
+        ],
+        col: [
+          0.85,
+          0.5,
+          0.22
+        ],
+        amt: 0.55,
+        warp: 0.4,
+        latRange: [
+          -60,
+          60
+        ]
+      },
+      {
+        t: "spots",
+        n: 30,
+        size: [
+          2.5,
+          6
+        ],
+        col: [
+          0.93,
+          0.92,
+          0.84
+        ],
+        amt: 0.5,
+        warp: 0.6,
+        latRange: [
+          -50,
+          50
+        ]
+      },
+      {
+        t: "spots",
+        n: 70,
+        size: [
+          0.4,
+          1.4
+        ],
+        cols: [
+          [
+            0.08,
+            0.06,
+            0.05
+          ],
+          [
+            0.18,
+            0.12,
+            0.08
+          ],
+          [
+            0.35,
+            0.2,
+            0.1
+          ]
+        ],
+        amt: 0.9,
+        warp: 0.3,
+        glow: 0.9,
+        latRange: [
+          -65,
+          65
+        ]
+      },
+      {
+        t: "ring",
+        lat: -18.7,
+        lon: 104.7,
+        r: 17,
+        w: 3.2,
+        col: [
+          0.78,
+          0.3,
+          0.14
+        ],
+        amt: 0.8,
+        warp: 0.4
+      },
+      {
+        t: "spot",
+        lat: -18.7,
+        lon: 104.7,
+        r: 0.9,
+        col: [
+          0.05,
+          0.04,
+          0.04
+        ]
+      },
+      {
+        t: "spot",
+        lat: 13,
+        lon: 51.2,
+        r: 2.2,
+        col: [
+          0.06,
+          0.05,
+          0.05
+        ],
+        warp: 0.4
+      },
+      {
+        t: "ring",
+        lat: -1.5,
+        lon: -153,
+        r: 5,
+        w: 1.5,
+        col: [
+          0.95,
+          0.94,
+          0.88
+        ],
+        amt: 0.6
+      },
+      {
+        t: "ring",
+        lat: 63,
+        lon: -124,
+        r: 8,
+        w: 2,
+        col: [
+          0.7,
+          0.3,
+          0.15
+        ],
+        amt: 0.5
+      }
+    ]
+  }),
+  europa: () => rocky({
+    base: [
+      0.88,
+      0.83,
+      0.74
+    ],
+    tint: [
+      0.74,
+      0.62,
+      0.5
+    ],
+    tintAmp: 0.35,
+    tintFreq: 3,
+    rough: 0.05,
+    craters: {
+      dens: 0.12,
+      depth: 0.12,
+      seed: 31,
+      oct: 4
+    },
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 90,
+        r: 70,
+        soft: 30,
+        warp: 12,
+        col: [
+          0.62,
+          0.5,
+          0.4
+        ],
+        amt: 0.55
+      },
+      {
+        t: "lines",
+        n: 70,
+        w: 0.55,
+        len: [
+          15,
+          75
+        ],
+        col: [
+          0.55,
+          0.34,
+          0.22
+        ],
+        amt: 0.85,
+        double: true,
+        wobble: 0.6,
+        h: 2e-4
+      },
+      {
+        t: "lines",
+        n: 50,
+        w: 0.3,
+        len: [
+          5,
+          25
+        ],
+        col: [
+          0.6,
+          0.42,
+          0.3
+        ],
+        amt: 0.6,
+        wobble: 0.4
+      },
+      {
+        t: "spots",
+        n: 18,
+        size: [
+          2,
+          6
+        ],
+        col: [
+          0.55,
+          0.4,
+          0.3
+        ],
+        amt: 0.6,
+        warp: 0.9,
+        latRange: [
+          -50,
+          50
+        ]
+      },
+      {
+        t: "crater",
+        lat: -25,
+        lon: 89,
+        r: 0.9,
+        depth: 6e-4,
+        bright: 0.6,
+        rays: {
+          len: 14,
+          amt: 0.4,
+          n: 8
+        }
+      }
+    ]
+  }),
+  ganymede: () => rocky({
+    base: [
+      0.62,
+      0.6,
+      0.57
+    ],
+    tint: [
+      0.7,
+      0.69,
+      0.66
+    ],
+    tintAmp: 0.4,
+    rough: 0.1,
+    fresh: [
+      0.3,
+      0.3,
+      0.3
+    ],
+    craters: {
+      dens: 0.6,
+      depth: 0.2,
+      seed: 41
+    },
+    features: [
+      {
+        t: "spot",
+        lat: 35,
+        lon: -145,
+        r: 36,
+        col: [
+          0.33,
+          0.29,
+          0.25
+        ],
+        warp: 0.5,
+        amt: 0.9
+      },
+      {
+        t: "spot",
+        lat: -5,
+        lon: 160,
+        r: 28,
+        col: [
+          0.35,
+          0.31,
+          0.27
+        ],
+        warp: 0.6,
+        amt: 0.85
+      },
+      {
+        t: "spot",
+        lat: -30,
+        lon: 30,
+        r: 22,
+        col: [
+          0.38,
+          0.34,
+          0.3
+        ],
+        warp: 0.7,
+        amt: 0.7
+      },
+      {
+        t: "spot",
+        lat: 30,
+        lon: 60,
+        r: 18,
+        col: [
+          0.38,
+          0.34,
+          0.3
+        ],
+        warp: 0.7,
+        amt: 0.6
+      },
+      {
+        t: "lines",
+        n: 90,
+        w: 0.6,
+        len: [
+          10,
+          40
+        ],
+        col: [
+          0.75,
+          0.74,
+          0.71
+        ],
+        amt: 0.5,
+        wobble: 0.8,
+        h: 3e-4
+      },
+      {
+        t: "cap",
+        north: true,
+        r: 40,
+        soft: 10,
+        warp: 6,
+        col: [
+          0.82,
+          0.82,
+          0.82
+        ],
+        amt: 0.5
+      },
+      {
+        t: "cap",
+        north: false,
+        r: 40,
+        soft: 10,
+        warp: 6,
+        col: [
+          0.82,
+          0.82,
+          0.82
+        ],
+        amt: 0.5
+      },
+      {
+        t: "crater",
+        lat: -38,
+        lon: -166,
+        r: 1.2,
+        depth: 1e-3,
+        bright: 0.6,
+        rays: {
+          len: 15,
+          amt: 0.45,
+          n: 8
+        }
+      },
+      {
+        t: "crater",
+        lat: 11,
+        lon: -27,
+        r: 1,
+        depth: 1e-3,
+        bright: 0.5,
+        rays: {
+          len: 12,
+          amt: 0.4,
+          n: 7
+        }
+      }
+    ]
+  }),
+  callisto: () => rocky({
+    base: [
+      0.34,
+      0.3,
+      0.26
+    ],
+    tint: [
+      0.3,
+      0.26,
+      0.22
+    ],
+    tintAmp: 0.4,
+    rough: 0.12,
+    fresh: [
+      0.45,
+      0.43,
+      0.4
+    ],
+    craters: {
+      dens: 0.97,
+      depth: 0.18,
+      seed: 51,
+      oct: 8
+    },
+    features: [
+      {
+        t: "crater",
+        lat: 14.7,
+        lon: -56,
+        r: 6,
+        depth: 1e-3,
+        big: 1,
+        floor: [
+          0.62,
+          0.6,
+          0.56
+        ],
+        floorAmt: 0.8,
+        flatten: 0.6,
+        rings: 7,
+        ringCol: [
+          0.5,
+          0.48,
+          0.44
+        ],
+        reach: 7
+      },
+      {
+        t: "crater",
+        lat: 32,
+        lon: -140,
+        r: 4,
+        depth: 1e-3,
+        big: 1,
+        floor: [
+          0.55,
+          0.53,
+          0.5
+        ],
+        floorAmt: 0.6,
+        rings: 4,
+        ringCol: [
+          0.45,
+          0.43,
+          0.4
+        ],
+        reach: 6
+      }
+    ]
+  }),
+  // Titan's hidden surface: dune seas near the equator, bright Xanadu, hydrocarbon seas in the north
+  titan: () => rocky({
+    base: [
+      0.42,
+      0.33,
+      0.22
+    ],
+    tint: [
+      0.3,
+      0.22,
+      0.15
+    ],
+    tintAmp: 0.5,
+    rough: 0.08,
+    craters: {
+      dens: 0.08,
+      depth: 0.1,
+      seed: 9,
+      oct: 4
+    },
+    features: [
+      {
+        t: "band",
+        lat0: -25,
+        lat1: 25,
+        col: [
+          0.22,
+          0.16,
+          0.11
+        ],
+        amt: 0.6,
+        warp: 8
+      },
+      {
+        t: "spot",
+        lat: -10,
+        lon: -100,
+        r: 22,
+        rx: 35,
+        ry: 16,
+        col: [
+          0.62,
+          0.55,
+          0.45
+        ],
+        warp: 0.5
+      },
+      {
+        t: "spot",
+        lat: 68,
+        lon: -50,
+        r: 9,
+        col: [
+          0.05,
+          0.05,
+          0.07
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: 78,
+        lon: -110,
+        r: 5,
+        col: [
+          0.05,
+          0.05,
+          0.07
+        ],
+        warp: 0.6
+      },
+      {
+        t: "spot",
+        lat: 74,
+        lon: -75,
+        r: 4,
+        col: [
+          0.05,
+          0.05,
+          0.07
+        ],
+        warp: 0.6
+      }
+    ]
+  }),
+  enceladus: () => rocky({
+    base: [
+      0.94,
+      0.95,
+      0.97
+    ],
+    tint: [
+      0.88,
+      0.9,
+      0.93
+    ],
+    tintAmp: 0.4,
+    rough: 0.04,
+    fresh: [
+      0.06,
+      0.06,
+      0.06
+    ],
+    craters: {
+      dens: 0.55,
+      depth: 0.25,
+      seed: 61
+    },
+    craterMod: (lat) => smoothstep(-30, 10, lat) * 0.9,
+    features: [
+      {
+        t: "path",
+        pts: [
+          [
+            -72,
+            -170
+          ],
+          [
+            -80,
+            -120
+          ],
+          [
+            -84,
+            -60
+          ],
+          [
+            -80,
+            -10
+          ]
+        ],
+        w: 1,
+        depth: 12e-4,
+        col: [
+          0.62,
+          0.78,
+          0.82
+        ]
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -70,
+            165
+          ],
+          [
+            -80,
+            -150
+          ],
+          [
+            -86,
+            -80
+          ],
+          [
+            -82,
+            0
+          ],
+          [
+            -76,
+            30
+          ]
+        ],
+        w: 1,
+        depth: 12e-4,
+        col: [
+          0.62,
+          0.78,
+          0.82
+        ]
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -70,
+            140
+          ],
+          [
+            -78,
+            175
+          ],
+          [
+            -84,
+            120
+          ],
+          [
+            -80,
+            70
+          ]
+        ],
+        w: 1,
+        depth: 12e-4,
+        col: [
+          0.62,
+          0.78,
+          0.82
+        ]
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -68,
+            120
+          ],
+          [
+            -74,
+            90
+          ],
+          [
+            -76,
+            60
+          ]
+        ],
+        w: 1,
+        depth: 12e-4,
+        col: [
+          0.62,
+          0.78,
+          0.82
+        ]
+      },
+      {
+        t: "lines",
+        n: 30,
+        w: 0.7,
+        len: [
+          10,
+          35
+        ],
+        latRange: [
+          -25,
+          30
+        ],
+        col: [
+          0.82,
+          0.86,
+          0.9
+        ],
+        amt: 0.4,
+        h: 6e-4
+      }
+    ]
+  }),
+  mimas: () => rocky({
+    base: [
+      0.8,
+      0.79,
+      0.78
+    ],
+    tint: [
+      0.7,
+      0.7,
+      0.7
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    craters: {
+      dens: 0.95,
+      depth: 0.32,
+      seed: 71
+    },
+    features: [
+      {
+        t: "crater",
+        lat: 1.4,
+        lon: -111.8,
+        r: 20,
+        depth: 0.05,
+        big: 1,
+        floor: [
+          0.72,
+          0.71,
+          0.7
+        ],
+        floorAmt: 0.3
+      }
+    ]
+  }),
+  tethys: () => rocky({
+    base: [
+      0.88,
+      0.88,
+      0.87
+    ],
+    tint: [
+      0.8,
+      0.8,
+      0.79
+    ],
+    tintAmp: 0.3,
+    rough: 0.05,
+    craters: {
+      dens: 0.85,
+      depth: 0.25,
+      seed: 81
+    },
+    features: [
+      {
+        t: "crater",
+        lat: 32.8,
+        lon: -128.9,
+        r: 24,
+        depth: 0.012,
+        big: 1
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            70,
+            30
+          ],
+          [
+            40,
+            5
+          ],
+          [
+            10,
+            -5
+          ],
+          [
+            -20,
+            -5
+          ],
+          [
+            -50,
+            10
+          ],
+          [
+            -75,
+            40
+          ]
+        ],
+        w: 4,
+        depth: 6e-3,
+        warp: 0.8,
+        wall: true
+      },
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 90,
+        r: 60,
+        soft: 30,
+        col: [
+          0.78,
+          0.8,
+          0.82
+        ],
+        amt: 0.4
+      }
+    ]
+  }),
+  dione: () => rocky({
+    base: [
+      0.8,
+      0.8,
+      0.79
+    ],
+    tint: [
+      0.7,
+      0.7,
+      0.7
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    craters: {
+      dens: 0.8,
+      depth: 0.25,
+      seed: 91
+    },
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 90,
+        r: 70,
+        soft: 25,
+        warp: 10,
+        col: [
+          0.55,
+          0.55,
+          0.56
+        ],
+        amt: 0.6,
+        flat: 0.5
+      },
+      {
+        t: "lines",
+        n: 30,
+        w: 0.6,
+        len: [
+          10,
+          45
+        ],
+        lonRange: [
+          40,
+          140
+        ],
+        latRange: [
+          -50,
+          50
+        ],
+        col: [
+          0.95,
+          0.95,
+          0.96
+        ],
+        amt: 0.85,
+        wobble: 1.2,
+        h: 8e-4
+      }
+    ]
+  }),
+  rhea: () => rocky({
+    base: [
+      0.8,
+      0.79,
+      0.77
+    ],
+    tint: [
+      0.7,
+      0.69,
+      0.68
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    craters: {
+      dens: 0.92,
+      depth: 0.25,
+      seed: 101
+    },
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 90,
+        r: 65,
+        soft: 25,
+        warp: 10,
+        col: [
+          0.6,
+          0.6,
+          0.6
+        ],
+        amt: 0.5
+      },
+      {
+        t: "lines",
+        n: 22,
+        w: 0.5,
+        len: [
+          10,
+          40
+        ],
+        lonRange: [
+          50,
+          130
+        ],
+        latRange: [
+          -45,
+          45
+        ],
+        col: [
+          0.95,
+          0.95,
+          0.95
+        ],
+        amt: 0.7,
+        wobble: 1
+      },
+      {
+        t: "crater",
+        lat: -14,
+        lon: -112,
+        r: 1.8,
+        depth: 2e-3,
+        bright: 0.7,
+        rays: {
+          len: 20,
+          amt: 0.5,
+          n: 8
+        }
+      }
+    ]
+  }),
+  iapetus: () => rocky({
+    base: [
+      0.78,
+      0.76,
+      0.72
+    ],
+    tint: [
+      0.7,
+      0.68,
+      0.64
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    darkFloorCol: [
+      0.1,
+      0.07,
+      0.05
+    ],
+    craters: {
+      dens: 0.9,
+      depth: 0.28,
+      seed: 111
+    },
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: -90,
+        r: 68,
+        soft: 6,
+        warp: 16,
+        col: [
+          0.1,
+          0.065,
+          0.045
+        ],
+        darkFloors: 1
+      },
+      {
+        t: "ridge",
+        lat: 0,
+        lon: -90,
+        lonSpan: 110,
+        w: 1.4,
+        h: 0.022
+      },
+      {
+        t: "crater",
+        lat: 17,
+        lon: -28,
+        r: 22,
+        depth: 0.012,
+        big: 1
+      },
+      {
+        t: "crater",
+        lat: -44,
+        lon: -96,
+        r: 18,
+        depth: 0.012,
+        big: 1
+      }
+    ]
+  }),
+  hyperion: () => rocky({
+    base: [
+      0.66,
+      0.6,
+      0.52
+    ],
+    tint: [
+      0.5,
+      0.45,
+      0.38
+    ],
+    tintAmp: 0.4,
+    rough: 0.1,
+    darkFloorCol: [
+      0.18,
+      0.13,
+      0.09
+    ],
+    craters: {
+      dens: 0.97,
+      depth: 0.55,
+      seed: 121,
+      oct: 6
+    },
+    smooth: 0,
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 0,
+        r: 180,
+        soft: 1,
+        col: [
+          0.6,
+          0.55,
+          0.48
+        ],
+        amt: 0.01,
+        darkFloors: 1
+      }
+    ]
+  }),
+  miranda: () => rocky({
+    base: [
+      0.68,
+      0.68,
+      0.68
+    ],
+    tint: [
+      0.55,
+      0.55,
+      0.56
+    ],
+    tintAmp: 0.4,
+    rough: 0.08,
+    craters: {
+      dens: 0.7,
+      depth: 0.25,
+      seed: 131
+    },
+    features: [
+      {
+        t: "mare",
+        lat: -70,
+        lon: 0,
+        r: 22,
+        col: [
+          0.5,
+          0.5,
+          0.51
+        ],
+        warp: 0.4,
+        flat: 0.8
+      },
+      {
+        t: "mare",
+        lat: -20,
+        lon: -90,
+        r: 25,
+        col: [
+          0.56,
+          0.56,
+          0.57
+        ],
+        warp: 0.3,
+        flat: 0.8
+      },
+      {
+        t: "mare",
+        lat: -20,
+        lon: 90,
+        r: 24,
+        col: [
+          0.56,
+          0.56,
+          0.57
+        ],
+        warp: 0.3,
+        flat: 0.8
+      },
+      {
+        t: "lines",
+        n: 40,
+        w: 0.9,
+        len: [
+          8,
+          25
+        ],
+        latRange: [
+          -80,
+          0
+        ],
+        col: [
+          0.82,
+          0.82,
+          0.83
+        ],
+        amt: 0.7,
+        wobble: 0.3,
+        h: 3e-3
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            -15,
+            -15
+          ],
+          [
+            -35,
+            -25
+          ],
+          [
+            -55,
+            -35
+          ]
+        ],
+        w: 1.2,
+        depth: -0.02,
+        col: [
+          0.85,
+          0.85,
+          0.86
+        ],
+        amt: 0.6
+      }
+    ]
+  }),
+  ariel: () => rocky({
+    base: [
+      0.72,
+      0.72,
+      0.71
+    ],
+    tint: [
+      0.62,
+      0.62,
+      0.62
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    craters: {
+      dens: 0.55,
+      depth: 0.2,
+      seed: 141
+    },
+    features: [
+      {
+        t: "lines",
+        n: 18,
+        w: 1.2,
+        len: [
+          20,
+          70
+        ],
+        col: [
+          0.55,
+          0.55,
+          0.55
+        ],
+        amt: 0.6,
+        wobble: 0.5,
+        h: -2e-3
+      }
+    ]
+  }),
+  umbriel: () => rocky({
+    base: [
+      0.36,
+      0.36,
+      0.37
+    ],
+    tint: [
+      0.3,
+      0.3,
+      0.31
+    ],
+    tintAmp: 0.3,
+    rough: 0.06,
+    craters: {
+      dens: 0.95,
+      depth: 0.25,
+      seed: 151
+    },
+    features: [
+      {
+        t: "ring",
+        lat: -7.9,
+        lon: -86.4,
+        r: 4.5,
+        w: 1.2,
+        col: [
+          0.85,
+          0.85,
+          0.85
+        ],
+        amt: 0.9
+      }
+    ]
+  }),
+  titania: () => rocky({
+    base: [
+      0.6,
+      0.57,
+      0.55
+    ],
+    tint: [
+      0.5,
+      0.48,
+      0.47
+    ],
+    tintAmp: 0.35,
+    rough: 0.07,
+    craters: {
+      dens: 0.8,
+      depth: 0.22,
+      seed: 161
+    },
+    features: [
+      {
+        t: "path",
+        pts: [
+          [
+            -10,
+            0
+          ],
+          [
+            -25,
+            25
+          ],
+          [
+            -35,
+            60
+          ],
+          [
+            -30,
+            95
+          ]
+        ],
+        w: 2.2,
+        depth: 4e-3,
+        warp: 0.6,
+        wall: true
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            10,
+            -60
+          ],
+          [
+            -5,
+            -35
+          ],
+          [
+            -20,
+            -10
+          ]
+        ],
+        w: 1.6,
+        depth: 3e-3,
+        warp: 0.6
+      },
+      {
+        t: "crater",
+        lat: -9.2,
+        lon: -26,
+        r: 2.6,
+        depth: 3e-3,
+        bright: 0.5,
+        rays: {
+          len: 10,
+          amt: 0.3,
+          n: 6
+        }
+      }
+    ]
+  }),
+  oberon: () => rocky({
+    base: [
+      0.52,
+      0.48,
+      0.46
+    ],
+    tint: [
+      0.44,
+      0.4,
+      0.38
+    ],
+    tintAmp: 0.35,
+    rough: 0.07,
+    darkFloorCol: [
+      0.12,
+      0.1,
+      0.09
+    ],
+    craters: {
+      dens: 0.92,
+      depth: 0.25,
+      seed: 171
+    },
+    features: [
+      {
+        t: "hemi",
+        lat: 0,
+        lon: 0,
+        r: 180,
+        soft: 1,
+        col: [
+          0.5,
+          0.47,
+          0.45
+        ],
+        amt: 0.01,
+        darkFloors: 0.8
+      },
+      {
+        t: "crater",
+        lat: -46,
+        lon: 44,
+        r: 7,
+        depth: 4e-3,
+        floor: [
+          0.15,
+          0.13,
+          0.12
+        ],
+        floorAmt: 0.8,
+        bright: 0.2,
+        rays: {
+          len: 10,
+          amt: 0.25,
+          n: 6
+        }
+      }
+    ]
+  }),
+  triton: () => rocky({
+    base: [
+      0.66,
+      0.68,
+      0.64
+    ],
+    tint: [
+      0.58,
+      0.62,
+      0.6
+    ],
+    tintAmp: 0.5,
+    rough: 0.08,
+    craters: {
+      dens: 0.18,
+      depth: 0.15,
+      seed: 181,
+      oct: 5
+    },
+    features: [
+      {
+        t: "cap",
+        north: false,
+        r: 70,
+        soft: 6,
+        warp: 10,
+        col: [
+          0.88,
+          0.76,
+          0.7
+        ]
+      },
+      {
+        t: "cells",
+        lat: 20,
+        lon: -30,
+        r: 55,
+        freq: 70,
+        col: [
+          0.58,
+          0.63,
+          0.58
+        ],
+        edge: [
+          0.42,
+          0.48,
+          0.45
+        ],
+        h: 4e-4
+      },
+      {
+        t: "spots",
+        n: 60,
+        size: [
+          0.4,
+          0.9
+        ],
+        latRange: [
+          -60,
+          -20
+        ],
+        col: [
+          0.32,
+          0.26,
+          0.24
+        ],
+        amt: 0.8,
+        warp: 0.6
+      }
+    ]
+  }),
+  pluto: () => rocky({
+    base: [
+      0.78,
+      0.66,
+      0.52
+    ],
+    tint: [
+      0.66,
+      0.5,
+      0.38
+    ],
+    tintAmp: 0.5,
+    rough: 0.08,
+    craters: {
+      dens: 0.4,
+      depth: 0.15,
+      seed: 191,
+      oct: 6
+    },
+    features: [
+      {
+        t: "spot",
+        lat: -5,
+        lon: 85,
+        r: 30,
+        rx: 55,
+        ry: 13,
+        col: [
+          0.24,
+          0.12,
+          0.08
+        ],
+        warp: 0.4
+      },
+      {
+        t: "spot",
+        lat: -8,
+        lon: -60,
+        r: 18,
+        rx: 28,
+        ry: 10,
+        col: [
+          0.3,
+          0.16,
+          0.1
+        ],
+        warp: 0.5,
+        amt: 0.85
+      },
+      {
+        t: "spot",
+        lat: -2,
+        lon: -140,
+        r: 20,
+        rx: 22,
+        ry: 16,
+        col: [
+          0.93,
+          0.89,
+          0.82
+        ],
+        warp: 0.4
+      },
+      {
+        t: "cells",
+        lat: 22,
+        lon: 178,
+        r: 21,
+        freq: 95,
+        col: [
+          0.95,
+          0.92,
+          0.86
+        ],
+        edge: [
+          0.72,
+          0.66,
+          0.58
+        ],
+        h: 6e-4
+      },
+      {
+        t: "cap",
+        north: true,
+        r: 40,
+        soft: 10,
+        warp: 8,
+        col: [
+          0.76,
+          0.7,
+          0.58
+        ],
+        amt: 0.7
+      },
+      {
+        t: "cap",
+        north: true,
+        r: 12,
+        soft: 5,
+        warp: 3,
+        col: [
+          0.72,
+          0.72,
+          0.72
+        ],
+        amt: 0.6
+      }
+    ]
+  }),
+  charon: () => rocky({
+    base: [
+      0.56,
+      0.54,
+      0.53
+    ],
+    tint: [
+      0.48,
+      0.47,
+      0.46
+    ],
+    tintAmp: 0.35,
+    rough: 0.06,
+    craters: {
+      dens: 0.6,
+      depth: 0.22,
+      seed: 201
+    },
+    features: [
+      {
+        t: "cap",
+        north: true,
+        r: 22,
+        soft: 6,
+        warp: 6,
+        col: [
+          0.36,
+          0.2,
+          0.14
+        ]
+      },
+      {
+        t: "path",
+        pts: [
+          [
+            5,
+            -60
+          ],
+          [
+            12,
+            0
+          ],
+          [
+            5,
+            60
+          ]
+        ],
+        w: 2.5,
+        depth: 6e-3,
+        warp: 0.8,
+        wall: true
+      },
+      {
+        t: "mare",
+        lat: -25,
+        lon: 0,
+        r: 40,
+        col: [
+          0.6,
+          0.58,
+          0.57
+        ],
+        flat: 0.6,
+        warp: 0.4
+      }
+    ]
+  }),
+  ceres: () => rocky({
+    base: [
+      0.32,
+      0.31,
+      0.3
+    ],
+    tint: [
+      0.27,
+      0.27,
+      0.27
+    ],
+    tintAmp: 0.4,
+    rough: 0.08,
+    fresh: [
+      0.2,
+      0.2,
+      0.2
+    ],
+    craters: {
+      dens: 0.9,
+      depth: 0.28,
+      seed: 211
+    },
+    features: [
+      {
+        t: "crater",
+        lat: 19.8,
+        lon: -120.7,
+        r: 5.6,
+        depth: 0.012,
+        big: 1
+      },
+      {
+        t: "spot",
+        lat: 19.8,
+        lon: -120.7,
+        r: 0.7,
+        col: [
+          1,
+          1,
+          0.98
+        ],
+        soft: 0.3
+      },
+      {
+        t: "spots",
+        n: 4,
+        size: [
+          0.2,
+          0.4
+        ],
+        latRange: [
+          20,
+          22
+        ],
+        lonRange: [
+          -118,
+          -116
+        ],
+        col: [
+          0.9,
+          0.9,
+          0.88
+        ],
+        amt: 0.9
+      },
+      {
+        t: "volcano",
+        lat: -10.5,
+        lon: -43.8,
+        r: 1.4,
+        h: 9e-3,
+        caldera: 0,
+        col: [
+          0.7,
+          0.7,
+          0.68
+        ],
+        amt: 0.7
+      },
+      {
+        t: "crater",
+        lat: 2,
+        lon: 120,
+        r: 17,
+        depth: 0.012,
+        big: 1
+      }
+    ]
+  }),
+  vesta: () => rocky({
+    base: [
+      0.56,
+      0.52,
+      0.48
+    ],
+    tint: [
+      0.42,
+      0.38,
+      0.34
+    ],
+    tintAmp: 0.6,
+    tintFreq: 3,
+    rough: 0.1,
+    craters: {
+      dens: 0.85,
+      depth: 0.3,
+      seed: 221
+    },
+    features: [
+      {
+        t: "crater",
+        lat: -75,
+        lon: -59,
+        r: 31,
+        depth: 0.1,
+        big: 1
+      },
+      {
+        t: "crater",
+        lat: -52,
+        lon: -170,
+        r: 22,
+        depth: 0.05,
+        big: 0.6
+      },
+      {
+        t: "band",
+        lat0: -22,
+        lat1: -6,
+        col: [
+          0.48,
+          0.44,
+          0.4
+        ],
+        amt: 0.4
+      },
+      {
+        t: "crater",
+        lat: 9,
+        lon: -170,
+        r: 6,
+        depth: 0.03
+      },
+      {
+        t: "crater",
+        lat: 13,
+        lon: -162,
+        r: 4.5,
+        depth: 0.025
+      },
+      {
+        t: "crater",
+        lat: 4,
+        lon: -165,
+        r: 3.5,
+        depth: 0.02
+      }
+    ],
+    post: (p, lat, _lon, o) => {
+      if (lat > -28 && lat < 0) {
+        const s = Math.sin(lat * 1.6 + noise3(p[0] * 8, p[1] * 8, p[2] * 8) * 0.6);
+        o.h -= 4e-3 * smoothstep(0.85, 1, s) * smoothstep(-28, -18, lat) * smoothstep(0, -6, lat);
+      }
+    }
+  }),
+  phobos: () => rocky({
+    base: [
+      0.36,
+      0.33,
+      0.3
+    ],
+    tint: [
+      0.3,
+      0.27,
+      0.25
+    ],
+    tintAmp: 0.4,
+    rough: 0.08,
+    craters: {
+      dens: 0.9,
+      depth: 0.35,
+      seed: 231
+    },
+    features: [
+      {
+        t: "crater",
+        lat: -1,
+        lon: -49,
+        r: 22,
+        depth: 0.12,
+        big: 0.5,
+        floor: [
+          0.42,
+          0.38,
+          0.34
+        ],
+        floorAmt: 0.4
+      },
+      {
+        t: "lines",
+        n: 26,
+        w: 1,
+        len: [
+          40,
+          80
+        ],
+        col: [
+          0.3,
+          0.27,
+          0.25
+        ],
+        amt: 0.5,
+        h: -6e-3
+      }
+    ]
+  })
+};
+function painterFor(b) {
+  const look = b.look || {};
+  const make = PAINTERS[look.paint || b.id];
+  if (make) return make();
+  return rocky({
+    base: look.col || [
+      0.5,
+      0.5,
+      0.5
+    ],
+    tint: (look.col || [
+      0.5,
+      0.5,
+      0.5
+    ]).map((v) => v * 0.78),
+    tintAmp: 0.4,
+    rough: 0.1,
+    craters: {
+      dens: look.craters === void 0 ? 0.8 : look.craters,
+      depth: 0.3,
+      seed: b.id.length * 97 + b.id.charCodeAt(0) | 0
+    },
+    smooth: look.smooth || 0
+  });
+}
+
+// src/textures.js
+var SurfaceTex = class {
+  constructor(w, h) {
+    this.w = w;
+    this.h = h;
+    this.col = new Uint8Array(w * h * 3);
+    this.hgt = new Float32Array(w * h);
+    this.aux = new Uint8Array(w * h * 4);
+    this.row = 0;
+    this.done = false;
+    this.texel = Math.PI / h;
+  }
+};
+var O = {
+  r: 0,
+  g: 0,
+  b: 0,
+  h: 0,
+  m: 0,
+  c: 0,
+  l: 0
+};
+function bakeRows(tex, paint, rows) {
+  const { w, h } = tex;
+  const end = Math.min(h, tex.row + rows);
+  const p = [
+    0,
+    0,
+    0
+  ];
+  for (let y = tex.row; y < end; y++) {
+    const lat = 90 - (y + 0.5) * 180 / h;
+    const la = lat * Math.PI / 180, cl = Math.cos(la), sl = Math.sin(la);
+    for (let x = 0; x < w; x++) {
+      const lon = -180 + (x + 0.5) * 360 / w;
+      const lo = lon * Math.PI / 180;
+      p[0] = cl * Math.cos(lo);
+      p[1] = cl * Math.sin(lo);
+      p[2] = sl;
+      O.r = O.g = O.b = 0.5;
+      O.h = 0;
+      O.m = 0;
+      O.c = 0;
+      O.l = 0;
+      paint(p, lat, lon, O, x, y);
+      const i = y * w + x, k = i * 3;
+      tex.col[k] = O.r * 255;
+      tex.col[k + 1] = O.g * 255;
+      tex.col[k + 2] = O.b * 255;
+      tex.hgt[i] = O.h;
+      tex.aux[i * 4] = O.m;
+      tex.aux[i * 4 + 1] = O.c * 255;
+      tex.aux[i * 4 + 2] = O.l * 255;
+    }
+  }
+  tex.row = end;
+  if (end >= h) tex.done = true;
+}
+var Baker = class {
+  constructor() {
+    this.queue = [];
+    this.painters = /* @__PURE__ */ new Map();
+  }
+  painter(b) {
+    let p = this.painters.get(b.id);
+    if (!p) {
+      p = painterFor(b);
+      this.painters.set(b.id, p);
+    }
+    return p;
+  }
+  low(b) {
+    if (!b.texLow) {
+      const t = new SurfaceTex(64, 32);
+      bakeRows(t, this.painter(b), 32);
+      b.texLow = t;
+    }
+    return b.texLow;
+  }
+  // Texture to use for body b this frame; `px` is its apparent radius in cells.
+  get(b, px) {
+    if (b.tex && b.tex.done) return b.tex;
+    const low = this.low(b);
+    if (px > 5 && !b.tex) {
+      const W = b.look.tex || 256;
+      b.tex = new SurfaceTex(W, W / 2);
+      this.queue.push(b);
+    }
+    if (b.tex) b.texPx = Math.max(b.texPx || 0, px);
+    return low;
+  }
+  // Spend up to `ms` milliseconds baking, biggest-on-screen body first.
+  work(ms) {
+    if (!this.queue.length) return;
+    const t0 = performance.now();
+    this.queue.sort((a, b) => (b.texPx || 0) - (a.texPx || 0));
+    while (this.queue.length && performance.now() - t0 < ms) {
+      const b = this.queue[0];
+      bakeRows(b.tex, this.painter(b), Math.max(1, Math.round(16384 / b.tex.w)));
+      if (b.tex.done) this.queue.shift();
+    }
+  }
+  // Bake a body completely right now (used at start-up for the first view).
+  now(b) {
+    this.get(b, 99);
+    if (!b.tex.done) bakeRows(b.tex, this.painter(b), b.tex.h);
+    this.queue = this.queue.filter((q) => q !== b);
+  }
+};
+function sampleTex(t, lon, lat, S2) {
+  const w = t.w, h = t.h;
+  let u = (lon / TAU + 0.5) * w - 0.5;
+  u -= Math.floor(u / w) * w;
+  let v = (0.5 - lat / Math.PI) * h - 0.5;
+  if (v < 0) v = 0;
+  else if (v > h - 1.001) v = h - 1.001;
+  const x0 = Math.floor(u), y0 = Math.floor(v), fx = u - x0, fy = v - y0;
+  const x1 = x0 + 1 >= w ? 0 : x0 + 1, y1 = y0 + 1;
+  const i00 = y0 * w + x0, i10 = y0 * w + x1, i01 = y1 * w + x0, i11 = y1 * w + x1;
+  const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+  const c = t.col, H = t.hgt, a = t.aux;
+  S2.r = (c[i00 * 3] * w00 + c[i10 * 3] * w10 + c[i01 * 3] * w01 + c[i11 * 3] * w11) / 255;
+  S2.g = (c[i00 * 3 + 1] * w00 + c[i10 * 3 + 1] * w10 + c[i01 * 3 + 1] * w01 + c[i11 * 3 + 1] * w11) / 255;
+  S2.b = (c[i00 * 3 + 2] * w00 + c[i10 * 3 + 2] * w10 + c[i01 * 3 + 2] * w01 + c[i11 * 3 + 2] * w11) / 255;
+  S2.h = H[i00] * w00 + H[i10] * w10 + H[i01] * w01 + H[i11] * w11;
+  const near = w00 >= 0.25 ? i00 : w10 >= 0.25 ? i10 : w01 >= 0.25 ? i01 : i11;
+  S2.m = a[near * 4];
+  S2.c = (a[i00 * 4 + 1] * w00 + a[i10 * 4 + 1] * w10 + a[i01 * 4 + 1] * w01 + a[i11 * 4 + 1] * w11) / 255;
+  S2.l = (a[i00 * 4 + 2] * w00 + a[i10 * 4 + 2] * w10 + a[i01 * 4 + 2] * w01 + a[i11 * 4 + 2] * w11) / 255;
+  return S2;
+}
+function sampleH(t, lon, lat) {
+  const w = t.w, h = t.h;
+  let u = (lon / TAU + 0.5) * w - 0.5;
+  u -= Math.floor(u / w) * w;
+  let v = (0.5 - lat / Math.PI) * h - 0.5;
+  if (v < 0) v = 0;
+  else if (v > h - 1.001) v = h - 1.001;
+  const x0 = Math.floor(u), y0 = Math.floor(v), fx = u - x0, fy = v - y0;
+  const x1 = x0 + 1 >= w ? 0 : x0 + 1, y1 = y0 + 1;
+  const H = t.hgt;
+  return (H[y0 * w + x0] * (1 - fx) + H[y0 * w + x1] * fx) * (1 - fy) + (H[y1 * w + x0] * (1 - fx) + H[y1 * w + x1] * fx) * fy;
+}
+
+// src/surface.js
+var RAD = 180 / Math.PI;
+var DRIFT = {
+  jupiter: (lat) => Math.abs(lat) < 7 ? 7.3 : lat >= 7 && lat < 17 ? 0.4 : lat >= 17 && lat < 25 ? 2.2 : lat <= -7 && lat > -18 ? -0.5 : lat <= -18 && lat > -27 ? -0.2 : lat <= -27 && lat > -37 ? -1 : 0,
+  saturn: (lat) => Math.abs(lat) < 15 ? 30 : Math.abs(lat) < 30 ? 12 : 0,
+  neptune: (lat) => Math.abs(lat) < 14 ? -80 : lat <= -14 && lat > -32 ? -65 : lat <= -32 && lat > -50 ? -30 : lat >= 14 && lat < 40 ? -40 : 8,
+  uranus: (lat) => Math.abs(lat) < 20 ? -12 : 18
+};
+var VORTICES = {
+  jupiter: [
+    {
+      lat: -22.3,
+      lon: 52,
+      rx: 7,
+      ry: 4.4,
+      core: [
+        0.74,
+        0.36,
+        0.2
+      ],
+      edge: [
+        0.86,
+        0.56,
+        0.38
+      ],
+      collar: [
+        0.94,
+        0.9,
+        0.82
+      ],
+      hollow: 1.5,
+      spin: 1,
+      period: 6,
+      seed: 1
+    },
+    {
+      lat: -33.2,
+      lon: 118,
+      rx: 2.3,
+      ry: 1.8,
+      core: [
+        0.84,
+        0.6,
+        0.46
+      ],
+      edge: [
+        0.95,
+        0.9,
+        0.84
+      ],
+      collar: [
+        0.9,
+        0.87,
+        0.82
+      ],
+      hollow: 1.3,
+      spin: 1,
+      period: 3,
+      seed: 2
+    },
+    {
+      lat: 15.4,
+      lon: 205,
+      rx: 2.4,
+      ry: 0.85,
+      core: [
+        0.36,
+        0.2,
+        0.13
+      ],
+      edge: [
+        0.5,
+        0.3,
+        0.2
+      ],
+      spin: -1,
+      period: 3,
+      seed: 3
+    },
+    {
+      lat: 15,
+      lon: 300,
+      rx: 1.8,
+      ry: 0.75,
+      core: [
+        0.38,
+        0.21,
+        0.14
+      ],
+      edge: [
+        0.5,
+        0.31,
+        0.21
+      ],
+      spin: -1,
+      period: 3,
+      seed: 4
+    },
+    {
+      lat: -40.5,
+      lon: 260,
+      rx: 1.6,
+      ry: 1.3,
+      core: [
+        0.97,
+        0.95,
+        0.9
+      ],
+      edge: [
+        0.92,
+        0.88,
+        0.82
+      ],
+      spin: 1,
+      period: 2,
+      seed: 5
+    }
+  ],
+  neptune: [
+    {
+      lat: -20,
+      lon: 30,
+      rx: 14,
+      ry: 7,
+      core: [
+        0.07,
+        0.13,
+        0.4
+      ],
+      edge: [
+        0.16,
+        0.27,
+        0.62
+      ],
+      spin: 1,
+      period: 0.8,
+      seed: 6,
+      companion: true
+    },
+    {
+      lat: -42,
+      lon: 140,
+      rx: 2.4,
+      ry: 1.4,
+      core: [
+        0.9,
+        0.94,
+        0.99
+      ],
+      edge: [
+        0.7,
+        0.8,
+        0.95
+      ],
+      spin: 1,
+      period: 0.5,
+      seed: 7
+    },
+    {
+      lat: -55,
+      lon: 250,
+      rx: 4,
+      ry: 2.6,
+      core: [
+        0.75,
+        0.85,
+        0.98
+      ],
+      edge: [
+        0.12,
+        0.22,
+        0.55
+      ],
+      spin: 1,
+      period: 0.6,
+      seed: 8
+    }
+  ],
+  saturn: [
+    {
+      lat: 41,
+      lon: 60,
+      rx: 1.8,
+      ry: 1.2,
+      core: [
+        0.92,
+        0.86,
+        0.72
+      ],
+      edge: [
+        0.82,
+        0.74,
+        0.58
+      ],
+      spin: -1,
+      period: 2,
+      seed: 9
+    }
+  ]
+};
+function vortex(v, latD, lonD, days, S2) {
+  let dl = lonD - v.lon;
+  dl -= Math.round(dl / 360) * 360;
+  const qx = dl * Math.cos(latD * DEG) / v.rx, qy = (latD - v.lat) / v.ry;
+  const q = Math.hypot(qx, qy);
+  const reach = v.hollow || 1.25;
+  if (q > reach + 0.2) return;
+  const ang = Math.atan2(qy, qx) + v.spin * (days / v.period * 6.283 * (1.15 - q * 0.6) + 2.6 * (1 - Math.min(1, q)));
+  const sx = q * Math.cos(ang), sy = q * Math.sin(ang);
+  const n = fbm3(sx * 2.6 + v.seed * 7, sy * 2.6, v.seed, 4);
+  const spiral = Math.sin(Math.atan2(sy, sx) * 2 + q * 9);
+  if (v.collar) {
+    const wc = smoothstep(0.95, 1.08, q) * smoothstep(reach + 0.15, reach - 0.25, q);
+    S2.r += (v.collar[0] - S2.r) * wc * 0.8;
+    S2.g += (v.collar[1] - S2.g) * wc * 0.8;
+    S2.b += (v.collar[2] - S2.b) * wc * 0.8;
+  }
+  const w = smoothstep(1.05, 0.88, q + n * 0.08);
+  if (w <= 0) return;
+  const t = q * q;
+  const k = 1 + n * 0.16 + spiral * 0.05;
+  const r = (v.core[0] + (v.edge[0] - v.core[0]) * t) * k, g = (v.core[1] + (v.edge[1] - v.core[1]) * t) * k, b = (v.core[2] + (v.edge[2] - v.core[2]) * t) * k;
+  S2.r += (r - S2.r) * w;
+  S2.g += (g - S2.g) * w;
+  S2.b += (b - S2.b) * w;
+  if (v.companion) {
+    const c = smoothstep(0.85, 1, q) * smoothstep(1.3, 1.05, q) * smoothstep(0.1, -0.5, qy) * smoothstep(0.2, 0.6, n + 0.5);
+    S2.r += (0.95 - S2.r) * c;
+    S2.g += (0.97 - S2.g) * c;
+    S2.b += (1 - S2.b) * c;
+  }
+}
+function hexagon(latD, lonD, px, py, S2) {
+  const rho = 90 - latD;
+  if (rho > 22) return;
+  const sec = ((lonD + 30) % 60 + 60) % 60 - 30;
+  const rh = 12 / Math.cos(sec * DEG);
+  const wave = 0.3 * Math.sin(lonD * DEG * 18 + noise3(px * 30, py * 30, 1) * 2);
+  const s = (rho + wave) / rh;
+  const inside = smoothstep(1.03, 0.97, s);
+  let r = S2.r, g = S2.g, b = S2.b;
+  const n = fbm3(px * 40, py * 40, 2.5, 3);
+  const ir = 0.4 + 0.2 * s + n * 0.04, ig = 0.5 + 0.12 * s + n * 0.04, ib = 0.56 + n * 0.03;
+  r += (ir - r) * inside;
+  g += (ig - g) * inside;
+  b += (ib - b) * inside;
+  const jet = Math.exp(-((s - 1) * (s - 1)) / 6e-3);
+  r += (0.3 - r) * jet * 0.85;
+  g += (0.27 - g) * jet * 0.85;
+  b += (0.22 - b) * jet * 0.85;
+  const rim = Math.exp(-((s - 1.12) * (s - 1.12)) / 4e-3);
+  r += (0.93 - r) * rim * 0.6;
+  g += (0.86 - g) * rim * 0.6;
+  b += (0.68 - b) * rim * 0.6;
+  if (rho < 4.5) {
+    const th = Math.atan2(py, px);
+    const sp = Math.sin(th * 3 + Math.log(rho + 0.2) * 7);
+    const eye = smoothstep(0.9, 0.5, rho), ring = Math.exp(-((rho - 1.3) * (rho - 1.3)) / 0.25);
+    const arms = smoothstep(4.5, 1.5, rho) * (0.5 + 0.5 * sp) * 0.3;
+    r += (0.32 - r) * eye;
+    g += (0.34 - g) * eye;
+    b += (0.34 - b) * eye;
+    r += (0.85 - r) * (ring * 0.6 + arms);
+    g += (0.84 - g) * (ring * 0.6 + arms);
+    b += (0.78 - b) * (ring * 0.6 + arms);
+  }
+  S2.r = r;
+  S2.g = g;
+  S2.b = b;
+}
+var CYC_N = [
+  [
+    0,
+    0
+  ]
+];
+var CYC_S = [
+  [
+    0,
+    0
+  ]
+];
+for (let k = 0; k < 8; k++) CYC_N.push([
+  7.2 * Math.cos(k * Math.PI / 4 + 0.3),
+  7.2 * Math.sin(k * Math.PI / 4 + 0.3)
+]);
+for (let k = 0; k < 5; k++) CYC_S.push([
+  6.6 * Math.cos(k * 2 * Math.PI / 5 + 1.1),
+  6.6 * Math.sin(k * 2 * Math.PI / 5 + 1.1)
+]);
+function cyclones(latD, lonD, S2, days) {
+  const north = latD > 0;
+  const rho = 90 - Math.abs(latD);
+  if (rho > 12) return;
+  const th = lonD * DEG * (north ? 1 : -1);
+  const x = rho * Math.cos(th), y = rho * Math.sin(th);
+  const list = north ? CYC_N : CYC_S, rad = north ? 2.3 : 2.9;
+  for (let i = 0; i < list.length; i++) {
+    const dx = x - list[i][0], dy = y - list[i][1];
+    const r = Math.hypot(dx, dy) / rad;
+    if (r > 1.25) continue;
+    const a = Math.atan2(dy, dx) + (north ? 1 : -1) * days * 0.8;
+    const sp = Math.sin(a * 2 - Math.log(r + 0.04) * 6 + i);
+    const w = smoothstep(1.25, 0.8, r);
+    const n = noise3(dx * 3, dy * 3, i * 3.3);
+    const lt = 0.5 + 0.5 * sp + n * 0.2;
+    const cr = 0.42 + 0.42 * lt, cg = 0.43 + 0.38 * lt, cb = 0.47 + 0.3 * lt;
+    S2.r += (cr - S2.r) * w * 0.85;
+    S2.g += (cg - S2.g) * w * 0.85;
+    S2.b += (cb - S2.b) * w * 0.85;
+    return;
+  }
+}
+var S = {
+  r: 0,
+  g: 0,
+  b: 0,
+  h: 0,
+  m: 0,
+  c: 0,
+  l: 0,
+  kind: 0,
+  spec: 0,
+  emit: 0,
+  er: 0,
+  eg: 0,
+  eb: 0
+};
+var CS = {
+  r: 0,
+  g: 0,
+  b: 0,
+  h: 0,
+  m: 0,
+  c: 0,
+  l: 0
+};
+function sampleSurface(b, tex, px, py, pz, lod, days, season) {
+  const lat = Math.asin(clamp(pz, -1, 1)), lon = Math.atan2(py, px);
+  const latD = lat * RAD;
+  const look = b.look, id = b.id;
+  let lonT = lon;
+  const drift = DRIFT[id];
+  if (drift) lonT = lon - drift(latD) * days * DEG;
+  else if (look.cloudDrift) lonT = lon - look.cloudDrift * days * DEG;
+  sampleTex(tex, lonT, lat, S);
+  S.kind = look.ramp;
+  S.spec = 0;
+  S.emit = 0;
+  const texel = tex.texel;
+  const fine = lod < texel ? clamp(Math.log2(texel / lod), 0, 7) : 0;
+  if (id === "earth") {
+    const cl = lon - 3 * days * DEG;
+    sampleTex(tex, cl, lat, CS);
+    let c = CS.c;
+    if (fine > 0) {
+      const f = 1 / texel;
+      const n = fbm3(px * f * 0.7, py * f * 0.7, pz * f * 0.7, Math.min(5, fine + 1));
+      c = clamp(c + n * 0.35 * Math.min(1, fine / 2), 0, 1);
+      const nl = fbm3(px * f * 1.3 + 7, py * f * 1.3, pz * f * 1.3, Math.min(5, fine));
+      if (S.m === 0) {
+        const k = 1 + nl * 0.25;
+        S.r *= k;
+        S.g *= k;
+        S.b *= k;
+        S.h += nl * texel * 0.08;
+      } else if (S.m === 2) {
+        S.h += nl * texel * 0.02;
+      }
+    }
+    S.c = smoothstep(0.12, 0.85, c);
+    S.kind = S.c > 0.5 ? K.CLOUD : S.m === 1 ? K.OCEAN : S.m === 2 ? K.ICE : K.LAND;
+    S.spec = S.m === 1 ? 1 : 0;
+    return S;
+  }
+  if (look.ramp === K.GAS) {
+    const v = VORTICES[id];
+    const lonDT = lonT * RAD;
+    if (v) for (let i = 0; i < v.length; i++) vortex(v[i], latD, lonDT, days, S);
+    if (id === "saturn" && latD > 66) hexagon(latD, lon * RAD, px, py, S);
+    if (id === "saturn" && latD < -84) {
+      const rho = 90 + latD, eye = smoothstep(1.4, 0.6, rho), ring = Math.exp(-((rho - 2) * (rho - 2)) / 0.6);
+      S.r += (0.4 - S.r) * eye + (0.9 - S.r) * ring * 0.4;
+      S.g += (0.38 - S.g) * eye + (0.85 - S.g) * ring * 0.4;
+      S.b += (0.34 - S.b) * eye + (0.75 - S.b) * ring * 0.4;
+    }
+    if (id === "jupiter" && Math.abs(latD) > 76) cyclones(latD, lon * RAD, S, days);
+    if (fine > 0) {
+      const f = 1 / texel;
+      const w = noise3(px * f * 0.5, py * f * 0.5, pz * f * 3);
+      const n = fbm3(px * f + w * 1.5, py * f, pz * f * 6, Math.min(5, fine + 1));
+      let k = 1 + n * 0.22;
+      if (fine > 1.5) {
+        const c = fbm3(px * f * 4 + w, py * f * 4, pz * f * 4, Math.min(4, fine - 1));
+        k += smoothstep(0.05, 0.45, c) * 0.25 * Math.min(1, fine - 1.5) - smoothstep(-0.1, -0.45, c) * 0.15;
+      }
+      S.r *= k;
+      S.g *= k;
+      S.b *= k;
+    }
+    return S;
+  }
+  if (id === "mars" && season !== void 0) {
+    const capN = 90 - (7 + Math.max(0, -season) * 1.35), capS = -90 + (7 + Math.max(0, season) * 1.35);
+    const nz = fbm3(px * 6, py * 6, pz * 6, 3) * 3;
+    const w = Math.max(smoothstep(capN - 1.5, capN + 1.5, latD + nz), smoothstep(capS + 1.5, capS - 1.5, latD + nz));
+    if (w > 0) {
+      S.r += (0.93 - S.r) * w * 0.85;
+      S.g += (0.92 - S.g) * w * 0.85;
+      S.b += (0.92 - S.b) * w * 0.85;
+      S.kind = K.ICE;
+    }
+  }
+  if (S.l > 0.02 && id === "io") {
+    S.emit = S.l;
+  }
+  if (fine > 0) {
+    const f = 1 / texel;
+    const n = fbm3(px * f, py * f, pz * f, Math.min(6, fine + 1));
+    const k = 1 + n * (look.ramp === K.CLOUD ? 0.05 : 0.14);
+    S.r *= k;
+    S.g *= k;
+    S.b *= k;
+    if (look.ramp !== K.CLOUD) S.h += detailHeight(b, px, py, pz, lod, texel, n);
+  }
+  return S;
+}
+var DO = {
+  h: 0,
+  f: 0
+};
+function detailHeight(b, px, py, pz, lod, texel, n) {
+  let h = n * texel * 0.12;
+  const dens = b.look.craters === void 0 ? 0.8 : b.look.craters;
+  if (dens > 0 && b.look.ramp !== K.GAS) {
+    DO.h = 0;
+    DO.f = 0;
+    const P = [
+      px,
+      py,
+      pz
+    ];
+    let cell = texel * 2.2;
+    for (let k = 0; k < 3 && cell > lod * 2; k++) {
+      craters(P, cell, dens * 0.8, 0.3, 900 + k * 7, DO, 0);
+      cell *= 0.5;
+    }
+    h += DO.h;
+  }
+  return h;
+}
+function sampleHeight(b, tex, px, py, pz, lod) {
+  const lat = Math.asin(clamp(pz, -1, 1)), lon = Math.atan2(py, px);
+  let h = sampleH(tex, lon, lat);
+  const texel = tex.texel;
+  if (lod < texel && b.look.ramp !== K.CLOUD && b.look.ramp !== K.GAS) {
+    const fine = clamp(Math.log2(texel / lod), 0, 7);
+    const f = 1 / texel;
+    if (b.id === "earth") h += fbm3(px * f * 1.3 + 7, py * f * 1.3, pz * f * 1.3, fine) * texel * 0.08;
+    else h += detailHeight(b, px, py, pz, lod, texel, fbm3(px * f, py * f, pz * f, fine + 1));
+  }
+  return h;
+}
+var SPOTS = [];
+{
+  let s = 12345;
+  const rnd = () => (s = s * 1103515245 + 12345 & 2147483647) / 2147483647;
+  for (let k = 0; k < 9; k++) {
+    const lat = (rnd() < 0.5 ? -1 : 1) * (8 + rnd() * 22), lon = rnd() * 360 - 180, r = 0.6 + rnd() * 1.6;
+    SPOTS.push({
+      c: [
+        Math.cos(lat * DEG) * Math.cos(lon * DEG),
+        Math.cos(lat * DEG) * Math.sin(lon * DEG),
+        Math.sin(lat * DEG)
+      ],
+      r: r * DEG
+    });
+    const n = 1 + Math.floor(rnd() * 3);
+    for (let j = 0; j < n; j++) {
+      const la = lat + (rnd() - 0.5) * 3, lo = lon + 2 + rnd() * 5;
+      SPOTS.push({
+        c: [
+          Math.cos(la * DEG) * Math.cos(lo * DEG),
+          Math.cos(la * DEG) * Math.sin(lo * DEG),
+          Math.sin(la * DEG)
+        ],
+        r: (0.3 + rnd() * 0.6) * DEG
+      });
+    }
+  }
+}
+function sampleSun(px, py, pz, mu, lod, days, out) {
+  const f = Math.min(600, 0.5 / Math.max(lod, 1e-5));
+  const oct = clamp(Math.log2(f / 8), 1, 6);
+  const g = fbm3(px * 80 + days * 0.3, py * 80, pz * 80, oct);
+  const gran = 1 + 0.12 * g;
+  let spot = 1;
+  for (const s of SPOTS) {
+    const d = Math.acos(clamp(px * s.c[0] + py * s.c[1] + pz * s.c[2], -1, 1));
+    if (d < s.r * 2.2) spot *= 1 - 0.55 * smoothstep(s.r * 2.2, s.r * 1.2, d) - 0.35 * smoothstep(s.r, s.r * 0.6, d);
+  }
+  const ld = 1 - 0.62 * (1 - mu) - 0.18 * (1 - mu) * (1 - mu);
+  const fac = 1 + 0.25 * smoothstep(0.35, 0.05, mu) * Math.max(0, fbm3(px * 30, py * 30, pz * 30, 3));
+  const I = ld * gran * spot * fac;
+  out.r = I * 1;
+  out.g = I * (0.86 + 0.1 * mu);
+  out.b = I * (0.62 + 0.25 * mu);
+  out.spot = spot;
+  out.gran = g;
+  return out;
+}
+
+// src/rings.js
+function build(r0, r1, step, fn) {
+  const n = Math.ceil((r1 - r0) / step);
+  const a = new Float32Array(n), c = new Float32Array(n * 3);
+  const o = {
+    a: 0,
+    r: 0,
+    g: 0,
+    b: 0
+  };
+  for (let i = 0; i < n; i++) {
+    o.a = 0;
+    o.r = o.g = o.b = 0.6;
+    fn(r0 + (i + 0.5) * step, o);
+    a[i] = clamp(o.a, 0, 1);
+    c[i * 3] = o.r;
+    c[i * 3 + 1] = o.g;
+    c[i * 3 + 2] = o.b;
+  }
+  const levels = [
+    {
+      a,
+      c,
+      n
+    }
+  ];
+  while (levels[levels.length - 1].n > 8) {
+    const p = levels[levels.length - 1], m = Math.floor(p.n / 2);
+    const a2 = new Float32Array(m), c2 = new Float32Array(m * 3);
+    for (let i = 0; i < m; i++) {
+      const w0 = p.a[2 * i], w1 = p.a[2 * i + 1];
+      a2[i] = (w0 + w1) / 2;
+      const ws = w0 + w1 + 1e-6;
+      for (let k = 0; k < 3; k++) c2[i * 3 + k] = (p.c[i * 6 + k] * (w0 + 1e-6) + p.c[i * 6 + 3 + k] * (w1 + 1e-6)) / (ws + 1e-6);
+    }
+    levels.push({
+      a: a2,
+      c: c2,
+      n: m
+    });
+  }
+  return {
+    r0,
+    r1,
+    step,
+    levels
+  };
+}
+var band = (r, a, b, s = 40) => smoothstep(a - s, a + s, r) * smoothstep(b + s, b - s, r);
+var gap = (r, c, w) => 1 - Math.exp(-((r - c) * (r - c)) / (w * w));
+function saturn() {
+  return build(66900, 182e3, 12, (r, o) => {
+    const n1 = noise3(r * 0.011, 0.5, 0.5), n2 = noise3(r * 0.07, 3.5, 1.5), n3 = noise3(r * 0.4, 7.5, 2.5);
+    let a = 0, col = [
+      0.6,
+      0.56,
+      0.5
+    ];
+    if (r < 74500) {
+      a = 0.025 * band(r, 66900, 74500);
+      col = [
+        0.5,
+        0.48,
+        0.45
+      ];
+    } else if (r < 92e3) {
+      a = (0.08 + 0.06 * n1 + 0.04 * n2) * band(r, 74658, 92e3, 30);
+      a += 0.18 * Math.exp(-((r - 90200) ** 2) / 4e4) + 0.12 * Math.exp(-((r - 85800) ** 2) / 1e4);
+      a *= gap(r, 77870, 60) * gap(r, 87500, 90);
+      col = [
+        0.55,
+        0.5,
+        0.45
+      ];
+    } else if (r < 117580) {
+      const inner = smoothstep(92e3, 99e3, r);
+      a = (0.62 + 0.3 * inner + 0.08 * n1 + 0.08 * n2 + 0.04 * n3) * band(r, 92e3, 117580, 25);
+      col = [
+        0.86 + 0.04 * n1,
+        0.79 + 0.03 * n1,
+        0.66
+      ];
+    } else if (r < 122170) {
+      a = (0.07 + 0.08 * Math.max(0, n2) + 0.12 * Math.exp(-((r - 120050) ** 2) / 2e4)) * gap(r, 117700, 80);
+      col = [
+        0.55,
+        0.52,
+        0.5
+      ];
+    } else if (r < 136800) {
+      a = (0.5 + 0.08 * n1 + 0.06 * n2 + 0.03 * n3) * band(r, 122170, 136775, 20);
+      a *= 1 - 0.3 * smoothstep(127e3, 133e3, r) * (0.5 + 0.5 * n2);
+      a *= gap(r, 133583, 170) * gap(r, 136505, 25);
+      col = [
+        0.8,
+        0.74,
+        0.64
+      ];
+    } else if (r < 141e3) {
+      a = 0.35 * Math.exp(-((r - 140180) ** 2) / 900);
+      col = [
+        0.92,
+        0.9,
+        0.86
+      ];
+    } else if (r < 176e3) {
+      a = 6e-3 * band(r, 166e3, 175e3, 2e3);
+      col = [
+        0.75,
+        0.7,
+        0.68
+      ];
+    } else a = 0;
+    o.a = a;
+    o.r = col[0];
+    o.g = col[1];
+    o.b = col[2];
+  });
+}
+function uranus() {
+  const RINGS = [
+    [
+      41837,
+      1.5,
+      0.6
+    ],
+    [
+      42234,
+      2,
+      0.6
+    ],
+    [
+      42571,
+      2.2,
+      0.6
+    ],
+    [
+      44718,
+      7,
+      0.7
+    ],
+    [
+      45661,
+      8,
+      0.65
+    ],
+    [
+      47176,
+      2,
+      0.5
+    ],
+    [
+      47627,
+      3,
+      0.8
+    ],
+    [
+      48300,
+      6,
+      0.6
+    ],
+    [
+      50024,
+      2,
+      0.4
+    ],
+    [
+      51149,
+      58,
+      0.9
+    ]
+  ];
+  return build(41e3, 103e3, 2, (r, o) => {
+    let a = 0;
+    for (const [c, w, op] of RINGS) a = Math.max(a, op * smoothstep(w / 2 + 1, w / 2 - 1, Math.abs(r - c)));
+    o.r = 0.3;
+    o.g = 0.3;
+    o.b = 0.31;
+    const nu = 4e-3 * band(r, 66100, 69900, 600), mu = 3e-3 * band(r, 86e3, 103e3, 3e3);
+    if (nu > a) {
+      a = nu;
+      o.r = 0.6;
+      o.g = 0.5;
+      o.b = 0.45;
+    }
+    if (mu > a) {
+      a = mu;
+      o.r = 0.5;
+      o.g = 0.65;
+      o.b = 0.9;
+    }
+    o.a = a;
+  });
+}
+function neptune() {
+  return build(4e4, 64e3, 2, (r, o) => {
+    let a = 8e-3 * band(r, 40900, 42900, 300);
+    a = Math.max(a, 0.05 * Math.exp(-((r - 53200) ** 2) / 1600), 4e-3 * band(r, 53200, 57200, 300), 0.02 * Math.exp(-((r - 57200) ** 2) / 400));
+    a = Math.max(a, 0.08 * Math.exp(-((r - 62932) ** 2) / 300));
+    o.a = a;
+    o.r = 0.45;
+    o.g = 0.42;
+    o.b = 0.42;
+  });
+}
+function jupiter() {
+  return build(89e3, 226e3, 40, (r, o) => {
+    let a = 4e-3 * band(r, 89400, 122800, 3e3) + 0.03 * band(r, 122800, 129200, 300);
+    a += 3e-3 * band(r, 129200, 182e3, 2e3) + 15e-4 * band(r, 182e3, 226e3, 3e3);
+    o.a = a;
+    o.r = 0.62;
+    o.g = 0.5;
+    o.b = 0.4;
+  });
+}
+function ringsFor(b) {
+  if (!b.rings) return null;
+  if (b.rings.main) return {
+    t: saturn(),
+    lit: 1
+  };
+  if (b.rings.uranian) return {
+    t: uranus(),
+    lit: 0.6
+  };
+  if (b.rings.neptunian) return {
+    t: neptune(),
+    lit: 0.8,
+    arcs: true
+  };
+  return {
+    t: jupiter(),
+    lit: 1.4,
+    dusty: true
+  };
+}
+function ringSample(R, r, fp, azim, days, RS) {
+  const t = R.t;
+  RS.a = 0;
+  if (r < t.r0 || r >= t.r1) return RS;
+  const lv = Math.max(0, Math.log2(Math.max(1, fp / t.step)));
+  const L = Math.min(t.levels.length - 1, Math.floor(lv));
+  const l = t.levels[L];
+  const s = t.step * (1 << L);
+  let u = (r - t.r0) / s - 0.5;
+  if (u < 0) u = 0;
+  const i0 = Math.min(l.n - 1, Math.floor(u)), i1 = Math.min(l.n - 1, i0 + 1), f = u - Math.floor(u);
+  let a = l.a[i0] * (1 - f) + l.a[i1] * f;
+  RS.r = l.c[i0 * 3] * (1 - f) + l.c[i1 * 3] * f;
+  RS.g = l.c[i0 * 3 + 1] * (1 - f) + l.c[i1 * 3 + 1] * f;
+  RS.b = l.c[i0 * 3 + 2] * (1 - f) + l.c[i1 * 3 + 2] * f;
+  if (fp < 40 && a > 0.05) {
+    const k = smoothstep(40, 4, fp);
+    a *= 1 + k * 0.35 * noise3(r * 0.9, 1.5, 0.5) * noise3(r * 0.23, 2.5, 4.5);
+  }
+  if (R.arcs && Math.abs(r - 62932) < 60) {
+    let az = (azim * 180 / Math.PI - 278.9 * days - 247) % 360;
+    if (az < 0) az += 360;
+    const arc = (c, w) => smoothstep(w, w * 0.6, Math.abs(az - c));
+    const g = arc(2, 2) + arc(8, 2.5) + arc(14, 2.5) + arc(25, 5);
+    a = Math.max(a, 0.45 * g * Math.exp(-((r - 62932) ** 2) / 300));
+  }
+  RS.a = clamp(a, 0, 1);
+  return RS;
+}
+
+// src/render.js
+var SUN_COL = [
+  1,
+  0.97,
+  0.92
+];
+var SUB = [];
+for (let sy = 0; sy < 3; sy++) for (let sx = 0; sx < 3; sx++) SUB.push([
+  (sx - 1) / 3,
+  (sy - 1) / 3
+]);
+var G_DASH = 45;
+var G_SLASH = 47;
+var G_BAR = 124;
+var G_BSL = 92;
+var G_DOT = 46;
+var G_STAR = 42;
+var G_PLUS = 43;
+var G_APOS = 39;
+var G_O = 111;
+var G_AT = 64;
+function chapman(X, mu) {
+  const c = Math.sqrt(X * 1.5707963);
+  if (mu >= 0) return c / ((c - 1) * mu + 1);
+  const s = Math.sqrt(Math.max(0, 1 - mu * mu));
+  return c / ((c - 1) * mu - 1) + 2 * c * Math.exp(X - X * s) * Math.sqrt(s);
+}
+var View = class {
+  constructor(stars, baker) {
+    this.stars = stars;
+    this.baker = baker;
+    this.marks = [];
+    this.ringCache = /* @__PURE__ */ new Map();
+    this.shapes = /* @__PURE__ */ new Map();
+    this.orbitCache = /* @__PURE__ */ new Map();
+    this.starI = null;
+    this.B = {};
+    this.A = {
+      r: 0,
+      g: 0,
+      b: 0,
+      tr: 1,
+      tg: 1,
+      tb: 1
+    };
+    this.RS = {
+      a: 0,
+      r: 0,
+      g: 0,
+      b: 0
+    };
+    this.SC = {
+      r: 0,
+      g: 0,
+      b: 0,
+      spot: 1,
+      gran: 0
+    };
+    this.dust = [];
+    this.time = 0;
+  }
+  setup(grid, font, cam) {
+    const cols = grid.cols, rows = grid.rows;
+    const aspect = font.cellW / font.cellH;
+    let fy = rows / 2 / Math.tan(cam.fov / 2);
+    let fx = fy / aspect;
+    const hf = 2 * Math.atan(cols / 2 / fx);
+    if (hf > 125 * DEG) {
+      fx = cols / 2 / Math.tan(62.5 * DEG);
+      fy = fx * aspect;
+    }
+    Object.assign(this, {
+      grid,
+      font,
+      cam,
+      cols,
+      rows,
+      fx,
+      fy,
+      aspect,
+      maskTable: font.maskTable
+    });
+    this.cellAng = 1 / Math.sqrt(fx * fy);
+    const n = cols * rows;
+    if (!this.starI || this.starI.length !== n) {
+      this.starI = new Float32Array(n);
+      this.skyL = new Float32Array(n);
+    }
+    this.halfDiag = Math.atan(Math.hypot(cols / 2 / fx, rows / 2 / fy));
+  }
+  // Camera-space projection of a camera-relative vector; returns false if behind.
+  project(x, y, z, out) {
+    const c = this.cam;
+    const cz = x * c.fwd[0] + y * c.fwd[1] + z * c.fwd[2];
+    if (cz <= 1e-9) return false;
+    const cx = x * c.right[0] + y * c.right[1] + z * c.right[2], cy = x * c.up[0] + y * c.up[1] + z * c.up[2];
+    out[0] = this.cols / 2 + cx / cz * this.fx;
+    out[1] = this.rows / 2 - cy / cz * this.fy;
+    out[2] = cz;
+    return true;
+  }
+  render(grid, sys, cam, font, opts) {
+    this.setup(grid, font, cam);
+    this.sys = sys;
+    this.opts = opts;
+    this.time += opts.dt || 0;
+    this.days = sys.jd - 2451545;
+    const g = grid;
+    g.ch.fill(32);
+    g.fg.fill(0);
+    g.bg.fill(0);
+    g.glow.fill(0);
+    g.depth.fill(Infinity);
+    g.kind.fill(K.SPACE);
+    this.starI.fill(0);
+    const camSun = Math.hypot(cam.pos[0], cam.pos[1], cam.pos[2]);
+    this.adapt = Math.pow(camSun / AU, 2 * 0.92);
+    this.sky();
+    this.drawStars();
+    this.drawSwarm();
+    this.marks.length = 0;
+    const res = [], pts = [];
+    const P = [
+      0,
+      0,
+      0
+    ];
+    for (const b of sys.bodies) {
+      const rx = b.pos[0] - cam.pos[0], ry = b.pos[1] - cam.pos[1], rz = b.pos[2] - cam.pos[2];
+      const d = Math.hypot(rx, ry, rz);
+      const bound = b.boundR * (b.look.plume ? 5 : 1);
+      const inside = d < bound * 1.05;
+      const ang = inside ? Math.PI : Math.asin(Math.min(1, bound / d));
+      const cz = (rx * cam.fwd[0] + ry * cam.fwd[1] + rz * cam.fwd[2]) / d;
+      const vis = inside || Math.acos(clamp(cz, -1, 1)) < this.halfDiag + ang + 0.02;
+      const onScreen = this.project(rx, ry, rz, P);
+      const pr = Math.atan(b.Rmax / d) * this.fy;
+      const m = {
+        b,
+        x: P[0],
+        y: P[1],
+        d,
+        pr,
+        on: onScreen && P[0] >= 0 && P[0] < this.cols && P[1] >= 0 && P[1] < this.rows,
+        rel: [
+          rx,
+          ry,
+          rz
+        ],
+        vis
+      };
+      this.marks.push(m);
+      if (!vis) continue;
+      const haloPx = Math.atan(bound / d) * this.fy;
+      if (pr >= 0.55 || b.atmo && haloPx > 1.2 || inside || b.rings && haloPx > 1.5) res.push(m);
+      else pts.push(m);
+    }
+    res.sort((a, b) => b.d - a.d);
+    for (const m of res) {
+      if (m.b.kind === "star") this.renderSun(m);
+      else this.renderBody(m);
+    }
+    if (opts.orbits) this.drawOrbits(opts);
+    for (const m of pts) this.drawPoint(m);
+    this.effects(opts);
+  }
+  // ---- sky ------------------------------------------------------------------------------------------
+  sky() {
+    const { cols, rows, fx, fy, cam, grid: g } = this;
+    const mw = this.stars.mw, W = mw.W, H = mw.H, img = mw.img;
+    const F = cam.fwd, R = cam.right, U = cam.up;
+    const gain = this.opts.mwGain === void 0 ? 1 : this.opts.mwGain;
+    for (let y = 0; y < rows; y++) {
+      const py = -(y + 0.5 - rows / 2) / fy;
+      for (let x = 0; x < cols; x++) {
+        const px = (x + 0.5 - cols / 2) / fx;
+        let dx = F[0] + R[0] * px + U[0] * py, dy = F[1] + R[1] * px + U[1] * py, dz = F[2] + R[2] * px + U[2] * py;
+        const l = Math.hypot(dx, dy, dz);
+        dx /= l;
+        dy /= l;
+        dz /= l;
+        const lon = Math.atan2(dy, dx), lat = Math.asin(dz);
+        let u = (lon / TAU + 0.5) * W - 0.5, v = (0.5 - lat / Math.PI) * H - 0.5;
+        if (u < 0) u += W;
+        if (v < 0) v = 0;
+        else if (v > H - 1.001) v = H - 1.001;
+        const x0 = Math.floor(u), y0 = Math.floor(v), fu = u - x0, fv = v - y0, x1 = x0 + 1 >= W ? 0 : x0 + 1;
+        const i = y * cols + x, k = i * 3;
+        for (let c = 0; c < 3; c++) {
+          const a = img[(y0 * W + x0) * 3 + c] * (1 - fu) + img[(y0 * W + x1) * 3 + c] * fu;
+          const b = img[((y0 + 1) * W + x0) * 3 + c] * (1 - fu) + img[((y0 + 1) * W + x1) * 3 + c] * fu;
+          g.bg[k + c] = (a * (1 - fv) + b * fv) * gain * 0.55;
+        }
+        const L = g.bg[k] + g.bg[k + 1] + g.bg[k + 2];
+        if (L > 0.012) {
+          const h = hashf(Math.floor(u * 3), Math.floor(v * 3), 77);
+          if (h < L * 9) {
+            g.ch[i] = h < L * 3 ? 58 : G_DOT;
+            g.fg[k] = g.bg[k] * 5 + 0.03;
+            g.fg[k + 1] = g.bg[k + 1] * 5 + 0.03;
+            g.fg[k + 2] = g.bg[k + 2] * 5 + 0.04;
+          }
+        }
+        g.kind[i] = K.SPACE;
+      }
+    }
+  }
+  drawStars() {
+    const { cols, rows, fx, fy, cam, grid: g } = this;
+    const st = this.stars, n = st.n;
+    const F = cam.fwd, R = cam.right, U = cam.up;
+    const minCz = Math.cos(this.halfDiag + 0.02);
+    const tw = this.opts.twinkle || 0;
+    for (let i = 0; i < n; i++) {
+      const sx = st.x[i], sy = st.y[i], sz = st.z[i];
+      const cz = sx * F[0] + sy * F[1] + sz * F[2];
+      if (cz < minCz) continue;
+      const X = cols / 2 + (sx * R[0] + sy * R[1] + sz * R[2]) / cz * fx;
+      const Y = rows / 2 - (sx * U[0] + sy * U[1] + sz * U[2]) / cz * fy;
+      const xi = Math.floor(X), yi = Math.floor(Y);
+      if (xi < 0 || yi < 0 || xi >= cols || yi >= rows) continue;
+      let I = Math.pow(10, -0.4 * (st.mag[i] - 1));
+      if (tw > 0) I *= 1 + tw * (hashf(i, Math.floor(this.time * 14)) - 0.5);
+      const c = yi * cols + xi;
+      if (I <= this.starI[c]) continue;
+      this.starI[c] = I;
+      let ch, k, glow;
+      if (I > 1.4) {
+        ch = G_STAR;
+        k = 1.25;
+        glow = Math.min(0.9, 0.25 + I * 0.08);
+      } else if (I > 0.5) {
+        ch = G_STAR;
+        k = 0.7 + I * 0.25;
+        glow = 0.15;
+      } else if (I > 0.16) {
+        ch = G_PLUS;
+        k = 0.45 + I * 0.8;
+        glow = 0.05;
+      } else {
+        ch = Y - yi < 0.45 ? G_APOS : G_DOT;
+        k = 0.12 + Math.sqrt(I) * 1.25;
+        glow = 0;
+      }
+      const k3 = c * 3;
+      g.ch[c] = ch;
+      g.fg[k3] = st.col[i * 3] * k;
+      g.fg[k3 + 1] = st.col[i * 3 + 1] * k;
+      g.fg[k3 + 2] = st.col[i * 3 + 2] * k;
+      g.glow[c] = glow;
+      g.kind[c] = K.SPACE;
+    }
+  }
+  drawSwarm() {
+    if (this.opts.swarm === false) return;
+    const { cols, rows, fx, fy, cam, grid: g } = this;
+    const s = this.sys.swarm, n = s.n, pos = s.pos;
+    const F = cam.fwd, R = cam.right, U = cam.up, C = cam.pos;
+    const COL = [
+      [
+        0.75,
+        0.68,
+        0.58
+      ],
+      [
+        0.72,
+        0.62,
+        0.52
+      ],
+      [
+        0.8,
+        0.62,
+        0.46
+      ],
+      [
+        0.66,
+        0.64,
+        0.72
+      ]
+    ];
+    for (let i = 0; i < n; i++) {
+      const x = pos[i * 3] - C[0], y = pos[i * 3 + 1] - C[1], z = pos[i * 3 + 2] - C[2];
+      const cz = x * F[0] + y * F[1] + z * F[2];
+      if (cz <= 0) continue;
+      const X = cols / 2 + (x * R[0] + y * R[1] + z * R[2]) / cz * fx;
+      const Y = rows / 2 - (x * U[0] + y * U[1] + z * U[2]) / cz * fy;
+      const xi = Math.floor(X), yi = Math.floor(Y);
+      if (xi < 0 || yi < 0 || xi >= cols || yi >= rows) continue;
+      const d = Math.hypot(x, y, z) / AU;
+      const I = clamp(0.22 * Math.pow(1 / Math.max(d, 2e-3), 0.55), 0.04, 0.7) * (0.55 + 0.45 * s.mag[i]);
+      const c = yi * cols + xi;
+      if (I * 0.3 <= this.starI[c]) continue;
+      this.starI[c] = I * 0.3;
+      const col = COL[s.type[i]], k3 = c * 3;
+      g.ch[c] = d < 0.02 ? G_O : Y - yi < 0.45 ? G_APOS : G_DOT;
+      g.fg[k3] = col[0] * I;
+      g.fg[k3 + 1] = col[1] * I;
+      g.fg[k3 + 2] = col[2] * I;
+      g.kind[c] = K.SPACE;
+    }
+  }
+  // ---- unresolved bodies --------------------------------------------------------------------------
+  drawPoint(m) {
+    if (!m.on) return;
+    const b = m.b, g = this.grid;
+    const xi = Math.floor(m.x), yi = Math.floor(m.y);
+    const c = yi * this.cols + xi;
+    if (g.depth[c] < m.d) return;
+    const k3 = c * 3;
+    if (b.kind === "star") {
+      const I2 = Math.min(6, 1.6 * Math.pow(AU / m.d, 0.6));
+      g.ch[c] = m.pr > 0.25 ? G_AT : G_STAR;
+      g.fg[k3] = 1.8;
+      g.fg[k3 + 1] = 1.7;
+      g.fg[k3 + 2] = 1.45;
+      g.bg[k3] = Math.min(1.6, 0.6 * I2);
+      g.bg[k3 + 1] = Math.min(1.5, 0.52 * I2);
+      g.bg[k3 + 2] = Math.min(1.3, 0.38 * I2);
+      g.glow[c] = 1;
+      g.depth[c] = m.d;
+      g.kind[c] = K.UI;
+      return;
+    }
+    const toCam = [
+      -m.rel[0] / m.d,
+      -m.rel[1] / m.d,
+      -m.rel[2] / m.d
+    ];
+    const cosA = toCam[0] * b.toSun[0] + toCam[1] * b.toSun[1] + toCam[2] * b.toSun[2];
+    const phase = Math.max(0.02, (1 + cosA) / 2);
+    const col = b.look.col || [
+      0.6,
+      0.6,
+      0.6
+    ];
+    const alb = 0.299 * col[0] + 0.587 * col[1] + 0.114 * col[2];
+    const flux = alb * 0.6 * (b.Rmean / m.d) ** 2 * (AU / b.sunDist) ** 2 * phase;
+    let mag = -26.74 - 2.5 * Math.log10(Math.max(flux, 1e-40));
+    const important = b.kind === "planet" || b.kind === "dwarf" || this.opts.target === b || this.opts.frame && (b.parentBody === this.opts.frame || b.parentBody === this.opts.frame.parentBody);
+    if (important) mag = Math.min(mag, 5.2);
+    if (mag > 6.8) return;
+    const I = Math.pow(10, -0.4 * (mag - 1));
+    if (I < this.starI[c] * 0.8) return;
+    let ch;
+    if (m.pr > 0.28) ch = G_O;
+    else if (I > 1.2) ch = G_STAR;
+    else if (I > 0.2) ch = G_PLUS;
+    else ch = m.y - yi < 0.45 ? G_APOS : G_DOT;
+    const k = clamp(0.25 + Math.sqrt(I) * 0.6, 0.25, 1.6);
+    g.ch[c] = ch;
+    g.fg[k3] = (col[0] * 0.7 + 0.3) * k;
+    g.fg[k3 + 1] = (col[1] * 0.7 + 0.3) * k;
+    g.fg[k3 + 2] = (col[2] * 0.7 + 0.3) * k;
+    g.glow[c] = Math.min(0.6, I * 0.12);
+    g.depth[c] = m.d;
+    g.kind[c] = K.SPACE;
+  }
+  // ---- the Sun ----------------------------------------------------------------------------------------
+  renderSun(m) {
+    const b = m.b, g = this.grid, { cols, rows, fx, fy, cam } = this;
+    const R = b.Req, d = m.d;
+    const ang = Math.asin(Math.min(1, R / d));
+    const coronaAng = Math.min(Math.PI * 0.45, ang * 6 + this.cellAng * 6);
+    const C = m.rel, cd = [
+      C[0] / d,
+      C[1] / d,
+      C[2] / d
+    ];
+    const ax = b.axes[0], ay = b.axes[1], az = b.axes[2];
+    const box2 = this.bbox(m, coronaAng);
+    if (!box2) return;
+    const SC = this.SC;
+    const F = cam.fwd, Rr = cam.right, U = cam.up;
+    const lodBase = this.cellAng * d / R;
+    for (let y = box2[1]; y <= box2[3]; y++) {
+      for (let x = box2[0]; x <= box2[2]; x++) {
+        let r = 0, gg = 0, bl = 0, hits = 0, mask = 0, glow = 0;
+        const i = y * cols + x;
+        const px0 = (x + 0.5 - cols / 2) / fx, py0 = -(y + 0.5 - rows / 2) / fy;
+        let dx = F[0] + Rr[0] * px0 + U[0] * py0, dy = F[1] + Rr[1] * px0 + U[1] * py0, dz = F[2] + Rr[2] * px0 + U[2] * py0;
+        let l = Math.hypot(dx, dy, dz);
+        const th = Math.acos(clamp((dx * cd[0] + dy * cd[1] + dz * cd[2]) / l, -1, 1));
+        const rim = th < ang + this.cellAng * 1.5 && th > ang - this.cellAng * 1.5;
+        const ns = rim ? 9 : th < ang ? 1 : 0;
+        for (let s = 0; s < ns; s++) {
+          const ox = ns === 9 ? SUB[s][0] : 0, oy = ns === 9 ? SUB[s][1] : 0;
+          const px = (x + 0.5 + ox - cols / 2) / fx, py = -(y + 0.5 + oy - rows / 2) / fy;
+          dx = F[0] + Rr[0] * px + U[0] * py;
+          dy = F[1] + Rr[1] * px + U[1] * py;
+          dz = F[2] + Rr[2] * px + U[2] * py;
+          l = Math.hypot(dx, dy, dz);
+          dx /= l;
+          dy /= l;
+          dz /= l;
+          const B = -(C[0] * dx + C[1] * dy + C[2] * dz);
+          const cc = d * d - R * R;
+          const disc = B * B - cc;
+          if (disc < 0) continue;
+          const t = -B - Math.sqrt(disc);
+          if (t <= 0) continue;
+          const hx = -C[0] + t * dx, hy = -C[1] + t * dy, hz = -C[2] + t * dz;
+          const mu = clamp(-(hx * dx + hy * dy + hz * dz) / R, 0, 1);
+          const bx = (hx * ax[0] + hy * ax[1] + hz * ax[2]) / R, by = (hx * ay[0] + hy * ay[1] + hz * ay[2]) / R, bz = (hx * az[0] + hy * az[1] + hz * az[2]) / R;
+          sampleSun(bx, by, bz, mu, lodBase / Math.max(0.2, mu), this.days, SC);
+          r += SC.r;
+          gg += SC.g;
+          bl += SC.b;
+          hits++;
+          if (ns === 9) mask |= 1 << s;
+        }
+        const k3 = i * 3;
+        if (th > ang * 0.98) {
+          const q = th / ang;
+          const pa = Math.atan2(dx * U[0] + dy * U[1] + dz * U[2], dx * Rr[0] + dy * Rr[1] + dz * Rr[2]);
+          const streak = 0.7 + 0.5 * Math.max(0, noise3(Math.cos(pa) * 3, Math.sin(pa) * 3, 0.5)) + 0.25 * noise3(Math.cos(pa) * 9, Math.sin(pa) * 9, 1.5);
+          const I = 0.9 * Math.pow(q, -2.6) * streak * smoothstep(coronaAng, coronaAng * 0.6, th);
+          const glare = 0.5 * Math.exp(-(th - ang) / (this.cellAng * 2.5));
+          const add2 = Math.min(2, I + glare);
+          g.bg[k3] += add2 * 1;
+          g.bg[k3 + 1] += add2 * 0.88;
+          g.bg[k3 + 2] += add2 * 0.7;
+          glow = Math.max(glow, Math.min(1, add2 * 0.7));
+          if (q < 1.12) {
+            const pr = smoothstep(0.55, 0.85, noise3(Math.cos(pa) * 7, Math.sin(pa) * 7, this.days * 0.05));
+            g.bg[k3] += pr * 1.2;
+            g.bg[k3 + 1] += pr * 0.25;
+            g.bg[k3 + 2] += pr * 0.2;
+          }
+        }
+        if (hits) {
+          const k = 3.1 / hits;
+          if (ns === 1 || mask === 511) {
+            g.bg[k3] = r * k;
+            g.bg[k3 + 1] = gg * k;
+            g.bg[k3 + 2] = bl * k;
+            const gr = SC.gran;
+            g.ch[i] = SC.spot < 0.6 ? G_STAR : gr > 0.25 ? G_AT : gr > 0 ? 79 : gr > -0.25 ? G_O : 58;
+            g.fg[k3] = r * k * 1.1;
+            g.fg[k3 + 1] = gg * k * 1.05;
+            g.fg[k3 + 2] = bl * k;
+          } else {
+            g.ch[i] = this.maskTable[mask];
+            g.fg[k3] = r * k * 1.2;
+            g.fg[k3 + 1] = gg * k * 1.1;
+            g.fg[k3 + 2] = bl * k;
+          }
+          glow = 1;
+          g.depth[i] = d - R;
+          g.kind[i] = K.SUN;
+        }
+        g.glow[i] = Math.max(g.glow[i], glow);
+      }
+    }
+  }
+  // Screen-space bounding box [x0, y0, x1, y1] of a cone around a body, or null if off-screen.
+  bbox(m, ang) {
+    const { cols, rows } = this;
+    if (ang > 1.2 || m.d < m.b.boundR * 1.05) return [
+      0,
+      0,
+      cols - 1,
+      rows - 1
+    ];
+    const C = m.rel, d = m.d, cam = this.cam;
+    const c = [
+      C[0] / d,
+      C[1] / d,
+      C[2] / d
+    ];
+    let e1 = [
+      c[1] * cam.up[2] - c[2] * cam.up[1],
+      c[2] * cam.up[0] - c[0] * cam.up[2],
+      c[0] * cam.up[1] - c[1] * cam.up[0]
+    ];
+    let l = Math.hypot(...e1);
+    if (l < 1e-6) {
+      e1 = cam.right.slice();
+      l = 1;
+    }
+    e1 = e1.map((v) => v / l);
+    const e2 = [
+      c[1] * e1[2] - c[2] * e1[1],
+      c[2] * e1[0] - c[0] * e1[2],
+      c[0] * e1[1] - c[1] * e1[0]
+    ];
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    const P = [
+      0,
+      0,
+      0
+    ];
+    for (let k = 0; k < 16; k++) {
+      const a = k / 16 * TAU, ck = Math.cos(a), sk = Math.sin(a);
+      const v = [
+        c[0] * ca + (e1[0] * ck + e2[0] * sk) * sa,
+        c[1] * ca + (e1[1] * ck + e2[1] * sk) * sa,
+        c[2] * ca + (e1[2] * ck + e2[2] * sk) * sa
+      ];
+      if (!this.project(v[0], v[1], v[2], P)) return [
+        0,
+        0,
+        cols - 1,
+        rows - 1
+      ];
+      x0 = Math.min(x0, P[0]);
+      x1 = Math.max(x1, P[0]);
+      y0 = Math.min(y0, P[1]);
+      y1 = Math.max(y1, P[1]);
+    }
+    const bx0 = Math.max(0, Math.floor(x0) - 1), by0 = Math.max(0, Math.floor(y0) - 1);
+    const bx1 = Math.min(cols - 1, Math.ceil(x1) + 1), by1 = Math.min(rows - 1, Math.ceil(y1) + 1);
+    if (bx0 > bx1 || by0 > by1) return null;
+    return [
+      bx0,
+      by0,
+      bx1,
+      by1
+    ];
+  }
+  // ---- worlds ---------------------------------------------------------------------------------------
+  prepareBody(m) {
+    const b = m.b, cam = this.cam, B = this.B;
+    const ax = b.axes[0], ay = b.axes[1], az = b.axes[2];
+    const toB = (v) => [
+      v[0] * ax[0] + v[1] * ax[1] + v[2] * ax[2],
+      v[0] * ay[0] + v[1] * ay[1] + v[2] * ay[2],
+      v[0] * az[0] + v[1] * az[1] + v[2] * az[2]
+    ];
+    const [ra, rb, rc] = b.radii;
+    const oc = toB([
+      -m.rel[0],
+      -m.rel[1],
+      -m.rel[2]
+    ]);
+    B.b = b;
+    B.look = b.look;
+    B.ra = ra;
+    B.rb = rb;
+    B.rc = rc;
+    B.ocx = oc[0];
+    B.ocy = oc[1];
+    B.ocz = oc[2];
+    B.ox = oc[0] / ra;
+    B.oy = oc[1] / rb;
+    B.oz = oc[2] / rc;
+    B.oo = B.ox * B.ox + B.oy * B.oy + B.oz * B.oz;
+    B.F = toB(cam.fwd);
+    B.R = toB(cam.right);
+    B.U = toB(cam.up);
+    const s = toB(b.toSun);
+    B.sx = s[0];
+    B.sy = s[1];
+    B.sz = s[2];
+    B.light = Math.min(3.2, (AU / b.sunDist) ** 2 * this.adapt) * 0.68;
+    B.d = m.d;
+    B.tex = this.baker.get(b, m.pr);
+    B.texFull = B.tex !== b.texLow;
+    B.sunAng = 695700 / b.sunDist;
+    B.kind = b.look.ramp;
+    B.relief = b.look.relief === void 0 ? 1 : b.look.relief;
+    if (B.kind === K.GAS || B.kind === K.CLOUD) B.relief = 0;
+    B.ls = b.look.ls === void 0 ? 0.45 : b.look.ls;
+    B.minn = b.look.minnaert || 0;
+    B.twilight = b.atmo ? B.kind === K.CLOUD || B.kind === K.GAS ? 0.06 : 0.03 : 0;
+    B.amb = 4e-3 + (b.parentBody && b.parentBody.kind === "planet" ? 0.01 : 0);
+    B.season = b.id === "mars" ? Math.asin(clamp(B.sz, -1, 1)) / DEG : void 0;
+    B.occ = [];
+    for (const o of this.sys.occludersFor(b)) {
+      const v = toB([
+        o.pos[0] - b.pos[0],
+        o.pos[1] - b.pos[1],
+        o.pos[2] - b.pos[2]
+      ]);
+      const along = v[0] * B.sx + v[1] * B.sy + v[2] * B.sz;
+      if (along <= 0) continue;
+      const lat2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - along * along;
+      const reach = o.Rmean + b.Rmax + along * B.sunAng * 1.2;
+      if (lat2 > reach * reach) continue;
+      B.occ.push({
+        x: v[0],
+        y: v[1],
+        z: v[2],
+        r: o.Rmean,
+        atmo: !!o.atmo && o.look.ramp !== K.GAS
+      });
+    }
+    B.atm = null;
+    if (b.atmo) {
+      const kmCell = Math.max(1e-3, (m.d - b.Req) * this.cellAng) * (b.look.halo === void 0 ? 0.3 : b.look.halo);
+      const comps = b.atmo.comps.map((c) => {
+        if (c.layer) {
+          const w = Math.max(c.layer[1], kmCell * 1.2);
+          return {
+            layer: true,
+            h0: c.layer[0],
+            w,
+            H: w,
+            br: c.beta[0] * c.layer[1] / w,
+            bg: c.beta[1] * c.layer[1] / w,
+            bb: c.beta[2] * c.layer[1] / w,
+            ar: c.abs[0],
+            ag: c.abs[1],
+            ab: c.abs[2],
+            g: c.g
+          };
+        }
+        const Hv = Math.max(c.H, kmCell);
+        const k = c.H / Hv;
+        const gv = Array.isArray(c.g) ? c.g : [
+          c.g,
+          c.g,
+          c.g
+        ];
+        return {
+          layer: false,
+          H: Hv,
+          br: c.beta[0] * k,
+          bg: c.beta[1] * k,
+          bb: c.beta[2] * k,
+          ar: c.abs[0] * k,
+          ag: c.abs[1] * k,
+          ab: c.abs[2] * k,
+          gr: gv[0],
+          gg: gv[1],
+          gb: gv[2],
+          ray: c.g === 0,
+          ms: c.ms || 0
+        };
+      });
+      let top = b.atmo.top;
+      for (const c of comps) top = Math.max(top, c.layer ? c.h0 + c.w * 3 : c.H * 7);
+      B.atm = {
+        comps,
+        top,
+        rt: 1 + top / ra,
+        aurora: b.atmo.aurora || null,
+        dense: b.atmo.comps[0].beta[0] * b.atmo.comps[0].H > 3
+      };
+      if (B.atm.aurora) {
+        const a = B.atm.aurora;
+        const la = a.poleLat * DEG, lo = a.poleLon * DEG;
+        a.v = [
+          Math.cos(la) * Math.cos(lo),
+          Math.cos(la) * Math.sin(lo),
+          Math.sin(la)
+        ];
+      }
+    }
+    B.rings = null;
+    if (b.rings) {
+      let rr = this.ringCache.get(b.id);
+      if (!rr) {
+        rr = ringsFor(b);
+        this.ringCache.set(b.id, rr);
+      }
+      B.rings = rr;
+    }
+    B.shape = b.shape ? this.shapeFor(b) : null;
+    B.plume = !!b.look.plume;
+  }
+  renderBody(m) {
+    this.prepareBody(m);
+    const B = this.B, b = m.b, g = this.grid, { cols, rows, fx, fy } = this;
+    let bound = b.boundR;
+    if (B.atm) bound = Math.max(bound, b.Req + B.atm.top);
+    if (B.plume) bound = b.Req * 5;
+    const ang = m.d <= bound ? Math.PI : Math.asin(Math.min(1, bound / m.d));
+    const box2 = this.bbox(m, ang);
+    if (!box2) return;
+    const res = this.res || (this.res = {
+      hit: false,
+      t: 0,
+      r: 0,
+      g: 0,
+      b: 0,
+      kind: 0,
+      glow: 0,
+      er: 0,
+      eg: 0,
+      eb: 0,
+      ch: 0
+    });
+    const BG = [
+      0,
+      0,
+      0
+    ];
+    const Fx = B.F[0], Fy = B.F[1], Fz = B.F[2], Rx = B.R[0], Ry = B.R[1], Rz = B.R[2], Ux = B.U[0], Uy = B.U[1], Uz = B.U[2];
+    const ox = B.ox, oy = B.oy, oz = B.oz, oo = B.oo;
+    const halve = !!B.atm && (box2[2] - box2[0]) * (box2[3] - box2[1]) > 1500;
+    const W = cols;
+    if (!this.rowA || this.rowA.length < W * 7) {
+      this.rowA = new Float64Array(W * 7);
+      this.rowS = new Int8Array(W);
+    }
+    const RA = this.rowA, RSt = this.rowS;
+    for (let y = box2[1]; y <= box2[3]; y++) {
+      if (halve) RSt.fill(-1);
+      for (let pass = 0; pass < (halve ? 2 : 1); pass++) for (let x = box2[0]; x <= box2[2]; x++) {
+        if (halve && (x - box2[0] & 1) !== pass && !(pass === 0 && x === box2[2])) continue;
+        if (halve && pass === 1 && RSt[x] !== -1) continue;
+        const i = y * cols + x, k3 = i * 3;
+        const px = (x + 0.5 - cols / 2) / fx, py = -(y + 0.5 - rows / 2) / fy;
+        let dx = Fx + Rx * px + Ux * py, dy = Fy + Ry * px + Uy * py, dz = Fz + Rz * px + Uz * py;
+        let l = Math.hypot(dx, dy, dz);
+        dx /= l;
+        dy /= l;
+        dz /= l;
+        const sx = dx / B.ra, sy = dy / B.rb, sz = dz / B.rc;
+        const A = sx * sx + sy * sy + sz * sz, Bq = ox * sx + oy * sy + oz * sz;
+        const tc = Math.max(0, -Bq / A);
+        const dmin = Math.sqrt(Math.max(0, oo - Bq * Bq / A));
+        const kmFromLimb = (dmin - 1) * B.ra - (B.look.visAlt || 0);
+        const cellKm = tc * this.cellAng * 1.15 + 1e-9;
+        const shapeBand = B.shape ? (B.shape.rmax - 1) * B.ra : 0;
+        const rim = kmFromLimb < cellKm * 1.2 + shapeBand && kmFromLimb > -cellKm * 1.2 - (B.shape ? (1 - B.shape.rmin) * B.ra : 0);
+        BG[0] = g.bg[k3];
+        BG[1] = g.bg[k3 + 1];
+        BG[2] = g.bg[k3 + 2];
+        const fg0 = g.fg[k3], fg1 = g.fg[k3 + 1], fg2 = g.fg[k3 + 2];
+        if (!rim) {
+          this.atmOverride = false;
+          if (halve && pass === 1) {
+            const a = x - 1, c = x + 1;
+            if (a >= box2[0] && c <= box2[2] && RSt[a] >= 0 && RSt[a] === RSt[c] && (RSt[a] === 0 || Math.abs(RA[a * 7 + 6] - RA[c * 7 + 6]) < 0.2 * Math.min(RA[a * 7 + 6], RA[c * 7 + 6]))) {
+              const A2 = this.A, ja = a * 7, jc = c * 7;
+              A2.r = (RA[ja] + RA[jc]) / 2;
+              A2.g = (RA[ja + 1] + RA[jc + 1]) / 2;
+              A2.b = (RA[ja + 2] + RA[jc + 2]) / 2;
+              A2.tr = (RA[ja + 3] + RA[jc + 3]) / 2;
+              A2.tg = (RA[ja + 4] + RA[jc + 4]) / 2;
+              A2.tb = (RA[ja + 5] + RA[jc + 5]) / 2;
+              this.atmOverride = true;
+            }
+          }
+          this.sampleRay(dx, dy, dz, BG, res);
+          this.atmOverride = false;
+          if (halve) {
+            const A2 = this.A, j = x * 7;
+            RA[j] = A2.r;
+            RA[j + 1] = A2.g;
+            RA[j + 2] = A2.b;
+            RA[j + 3] = A2.tr;
+            RA[j + 4] = A2.tg;
+            RA[j + 5] = A2.tb;
+            RA[j + 6] = res.t;
+            RSt[x] = res.hit ? 1 : 0;
+          }
+          if (res.hit) {
+            g.bg[k3] = res.r;
+            g.bg[k3 + 1] = res.g;
+            g.bg[k3 + 2] = res.b;
+            g.ch[i] = res.ch || 32;
+            if (res.ch) {
+              g.fg[k3] = res.fr;
+              g.fg[k3 + 1] = res.fgg;
+              g.fg[k3 + 2] = res.fb;
+            }
+            g.kind[i] = res.kind;
+            g.depth[i] = res.t;
+            g.glow[i] = res.glow;
+          } else if (res.t > 0) {
+            const A2 = this.A;
+            g.bg[k3] = res.r;
+            g.bg[k3 + 1] = res.g;
+            g.bg[k3 + 2] = res.b;
+            g.fg[k3] = fg0 * A2.tr + res.ir;
+            g.fg[k3 + 1] = fg1 * A2.tg + res.ig;
+            g.fg[k3 + 2] = fg2 * A2.tb + res.ib;
+            g.glow[i] *= (A2.tr + A2.tg + A2.tb) / 3;
+            if (res.ch) {
+              g.ch[i] = res.ch;
+              g.fg[k3] = res.fr;
+              g.fg[k3 + 1] = res.fgg;
+              g.fg[k3 + 2] = res.fb;
+              g.kind[i] = K.UI;
+              g.depth[i] = res.t;
+            } else if (res.glow > g.glow[i]) g.glow[i] = res.glow;
+            if (res.ring) g.depth[i] = Math.min(g.depth[i], res.t);
+          }
+          continue;
+        }
+        if (halve) RSt[x] = 2;
+        let hr = 0, hg2 = 0, hb = 0, nh = 0, mr = 0, mg = 0, mb = 0, nm = 0, mask = 0, tmin = Infinity, gl = 0, ir = 0, ig = 0, ib = 0, trs = 0;
+        for (let s = 0; s < 9; s++) {
+          const qx = px + SUB[s][0] / fx, qy = py - SUB[s][1] / fy;
+          let ex = Fx + Rx * qx + Ux * qy, ey = Fy + Ry * qx + Uy * qy, ez = Fz + Rz * qx + Uz * qy;
+          l = Math.hypot(ex, ey, ez);
+          ex /= l;
+          ey /= l;
+          ez /= l;
+          this.sampleRay(ex, ey, ez, BG, res);
+          if (res.hit) {
+            hr += res.r;
+            hg2 += res.g;
+            hb += res.b;
+            nh++;
+            mask |= 1 << s;
+            tmin = Math.min(tmin, res.t);
+            gl = Math.max(gl, res.glow);
+          } else {
+            mr += res.t > 0 ? res.r : BG[0];
+            mg += res.t > 0 ? res.g : BG[1];
+            mb += res.t > 0 ? res.b : BG[2];
+            nm++;
+            if (res.t > 0) {
+              ir += res.ir;
+              ig += res.ig;
+              ib += res.ib;
+              trs += (this.A.tr + this.A.tg + this.A.tb) / 3;
+            } else trs += 1;
+          }
+        }
+        if (nh === 9) {
+          g.bg[k3] = hr / 9;
+          g.bg[k3 + 1] = hg2 / 9;
+          g.bg[k3 + 2] = hb / 9;
+          g.ch[i] = 32;
+          g.kind[i] = res.kind;
+          g.depth[i] = tmin;
+          g.glow[i] = gl;
+        } else if (nh === 0) {
+          g.bg[k3] = mr / 9;
+          g.bg[k3 + 1] = mg / 9;
+          g.bg[k3 + 2] = mb / 9;
+          const tr = trs / 9;
+          g.fg[k3] = fg0 * tr + ir / 9;
+          g.fg[k3 + 1] = fg1 * tr + ig / 9;
+          g.fg[k3 + 2] = fg2 * tr + ib / 9;
+          g.glow[i] *= tr;
+        } else {
+          const kk = 1.2 / nh;
+          g.ch[i] = this.maskTable[mask];
+          g.fg[k3] = hr * kk + 0.01;
+          g.fg[k3 + 1] = hg2 * kk + 0.01;
+          g.fg[k3 + 2] = hb * kk + 0.012;
+          g.bg[k3] = mr / nm;
+          g.bg[k3 + 1] = mg / nm;
+          g.bg[k3 + 2] = mb / nm;
+          g.kind[i] = K.UI;
+          g.depth[i] = tmin;
+          g.glow[i] = gl * 0.5;
+        }
+      }
+    }
+  }
+  // Trace one ray (unit direction in body axes) against body, rings and atmosphere.
+  // On return res.hit tells whether the solid surface was struck; res.t > 0 if anything was.
+  sampleRay(dx, dy, dz, BG, res) {
+    const B = this.B;
+    const sx = dx / B.ra, sy = dy / B.rb, sz = dz / B.rc;
+    const ox = B.ox, oy = B.oy, oz = B.oz;
+    const A = sx * sx + sy * sy + sz * sz, Bq = ox * sx + oy * sy + oz * sz;
+    res.hit = false;
+    res.t = 0;
+    res.ch = 0;
+    res.glow = 0;
+    res.ring = false;
+    res.ir = res.ig = res.ib = 0;
+    let tHit = Infinity, qx = 0, qy = 0, qz = 0, nx = 0, ny = 0, nz = 0;
+    if (B.shape) {
+      const h = this.marchShape(ox, oy, oz, sx, sy, sz, A, Bq);
+      if (h) {
+        tHit = h.t;
+        qx = h.qx;
+        qy = h.qy;
+        qz = h.qz;
+        nx = h.nx;
+        ny = h.ny;
+        nz = h.nz;
+      }
+    } else {
+      const disc = Bq * Bq - A * (B.oo - 1);
+      if (disc >= 0) {
+        const t = (-Bq - Math.sqrt(disc)) / A;
+        if (t > 0) {
+          tHit = t;
+          qx = ox + t * sx;
+          qy = oy + t * sy;
+          qz = oz + t * sz;
+          nx = qx / B.ra;
+          ny = qy / B.rb;
+          nz = qz / B.rc;
+          const nl = Math.hypot(nx, ny, nz);
+          nx /= nl;
+          ny /= nl;
+          nz /= nl;
+        }
+      }
+    }
+    let ringT = Infinity;
+    const RS = this.RS;
+    if (B.rings && Math.abs(sz) > 1e-12) {
+      const t = -oz / sz;
+      if (t > 0 && t < tHit) {
+        const rx = (ox + t * sx) * B.ra, ry = (oy + t * sy) * B.ra;
+        const rr = Math.hypot(rx, ry);
+        const fp = t * this.cellAng / Math.max(0.03, Math.abs(dz)) + 0.5;
+        ringSample(B.rings, rr, fp, Math.atan2(ry, rx), this.days, RS);
+        if (RS.a > 5e-4) {
+          ringT = t;
+          this.ringLight(rx, ry, dx, dy, dz);
+        }
+      }
+    }
+    const A2 = this.A;
+    let inAtm = false, tAtm = 0;
+    if (B.atm) {
+      const rt = B.atm.rt;
+      const disc2 = Bq * Bq - A * (B.oo - rt * rt);
+      if (disc2 > 0) {
+        const sq = Math.sqrt(disc2);
+        let t0 = (-Bq - sq) / A, t1 = (-Bq + sq) / A;
+        if (t1 > 0) {
+          if (t0 < 0) t0 = 0;
+          if (tHit < t1) t1 = tHit;
+          if (t1 > t0) {
+            if (!this.atmOverride) this.atmosphere(ox, oy, oz, sx, sy, sz, dx, dy, dz, t0, t1);
+            inAtm = true;
+            tAtm = t1;
+          }
+        }
+      }
+    }
+    if (!inAtm) {
+      A2.tr = A2.tg = A2.tb = 1;
+      A2.r = A2.g = A2.b = 0;
+    }
+    let r, g, b;
+    if (tHit < Infinity) {
+      if (A2.tr + A2.tg + A2.tb > 6e-3) {
+        this.shadeSurface(qx, qy, qz, nx, ny, nz, dx, dy, dz, tHit, res);
+        r = res.r;
+        g = res.g;
+        b = res.b;
+      } else {
+        r = g = b = 0;
+        res.kind = K.CLOUD;
+        res.glow = 0;
+      }
+      res.hit = true;
+      res.t = tHit;
+    } else {
+      r = BG[0];
+      g = BG[1];
+      b = BG[2];
+    }
+    if (inAtm) {
+      r = r * A2.tr + A2.r;
+      g = g * A2.tg + A2.g;
+      b = b * A2.tb + A2.b;
+      res.ir = A2.r;
+      res.ig = A2.g;
+      res.ib = A2.b;
+      if (!res.hit) res.t = tAtm;
+    }
+    if (ringT < Infinity) {
+      const a = RS.a;
+      r = RS.r + r * (1 - a);
+      g = RS.g + g * (1 - a);
+      b = RS.b + b * (1 - a);
+      res.ring = true;
+      if (!res.hit) res.t = res.t || ringT;
+      if (a > 0.12 && !res.hit) {
+        const k = 1.25;
+        res.ch = this.ringGlyph(ox + ringT * sx, oy + ringT * sy, dx, dy, dz, ringT, a);
+        res.fr = RS.r * k + r * 0.3;
+        res.fgg = RS.g * k + g * 0.3;
+        res.fb = RS.b * k + b * 0.3;
+        r *= 0.55;
+        g *= 0.55;
+        b *= 0.55;
+        res.t = ringT;
+      }
+      if (res.hit && ringT < tHit && a > 0.12) {
+        res.kind = K.RING;
+      }
+    }
+    if (B.plume) {
+      const p = this.plume(ox, oy, oz, sx, sy, sz, dx, dy, dz, res.hit ? tHit : Infinity);
+      r += p * 0.75;
+      g += p * 0.85;
+      b += p;
+      res.glow = Math.max(res.glow, Math.min(0.5, p));
+      if (p > 2e-3 && !res.hit && !res.t) res.t = B.d;
+      if (!res.hit && p > 2e-3) {
+        res.ir += p * 0.75;
+        res.ig += p * 0.85;
+        res.ib += p;
+      }
+    }
+    res.r = r;
+    res.g = g;
+    res.b = b;
+    return res;
+  }
+  // Colour of the ring at a point (km, body axes, z = 0): sunlit or backlit, in Saturn's shadow or not.
+  ringLight(rx, ry, dx, dy, dz) {
+    const B = this.B, RS = this.RS;
+    const a = RS.a;
+    const sameSide = B.ocz > 0 === B.sz > 0;
+    const elev = Math.abs(B.sz);
+    let L;
+    if (sameSide) L = a * (0.55 + 0.45 * Math.pow(elev, 0.25)) * 1.5;
+    else L = a * (1 - a) * 1.3 * Math.pow(elev, 0.2);
+    if (B.rings.dusty) {
+      const back = Math.max(0, dx * B.sx + dy * B.sy + dz * B.sz);
+      L *= 1 + 20 * Math.pow(back, 8);
+    }
+    const px = rx / B.ra, py = ry / B.rb;
+    const qx = B.sx / B.ra, qy = B.sy / B.rb, qz = B.sz / B.rc;
+    const A = qx * qx + qy * qy + qz * qz, Bq = px * qx + py * qy;
+    const disc = Bq * Bq - A * (px * px + py * py - 1);
+    let sh = 1;
+    if (Bq < 0) {
+      const dmin = Math.sqrt(Math.max(0, px * px + py * py - Bq * Bq / A));
+      sh = smoothstep(0.985, 1.015, dmin);
+      if (disc < 0) sh = 1;
+    }
+    L *= sh * B.light * B.rings.lit;
+    RS.r *= L * SUN_COL[0];
+    RS.g *= L * SUN_COL[1];
+    RS.b *= L * SUN_COL[2];
+  }
+  ringGlyph(qx, qy, dx, dy, dz, t, a) {
+    const B = this.B;
+    const tl = Math.hypot(qx, qy) || 1;
+    const Tx = -qy / tl, Ty = qx / tl;
+    const tcx = Tx * B.R[0] + Ty * B.R[1], tcy = Tx * B.U[0] + Ty * B.U[1], tcz = Tx * B.F[0] + Ty * B.F[1];
+    const Px = t * (dx * B.R[0] + dy * B.R[1] + dz * B.R[2]), Py = t * (dx * B.U[0] + dy * B.U[1] + dz * B.U[2]), Pz = t * (dx * B.F[0] + dy * B.F[1] + dz * B.F[2]);
+    const sxd = tcx * Pz - Px * tcz, syd = tcy * Pz - Py * tcz;
+    let ang = Math.atan2(syd, sxd);
+    if (ang < 0) ang += Math.PI;
+    if (ang >= Math.PI) ang -= Math.PI;
+    const deg = ang / DEG;
+    if (deg < 28 || deg >= 152) return a > 0.55 ? 61 : a > 0.25 ? G_DASH : G_DOT;
+    if (deg > 62 && deg < 118) return Px < 0 ? 40 : 41;
+    if (a < 0.3) return 58;
+    return deg < 90 ? G_SLASH : G_BSL;
+  }
+  // Lit colour of the surface point q (on the unit ellipsoid, body axes scaled), normal n.
+  shadeSurface(qx, qy, qz, nx, ny, nz, dx, dy, dz, t, res) {
+    const B = this.B, b = B.b;
+    const ql = Math.hypot(qx, qy, qz);
+    const px = qx / ql, py = qy / ql, pz = qz / ql;
+    const mu0r = nx * B.sx + ny * B.sy + nz * B.sz;
+    const mu = Math.max(0.02, -(nx * dx + ny * dy + nz * dz));
+    const lod = t * this.cellAng / Math.max(0.18, mu) / B.ra;
+    sampleSurface(b, B.tex, px, py, pz, lod, this.days, B.season);
+    let ar = S.r, ag = S.g, ab = S.b;
+    let kind = S.kind;
+    let mu0 = mu0r;
+    if (B.relief > 0 && mu0r > -0.2 && mu0r < 0.999) {
+      let tx = B.sx - mu0r * nx, ty = B.sy - mu0r * ny, tz = B.sz - mu0r * nz;
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      tx /= tl;
+      ty /= tl;
+      tz /= tl;
+      const eps = Math.max(lod * 1.4, Math.min(B.tex.texel * 0.8, lod * 6));
+      const h1 = sampleHeight(b, B.tex, px + tx * eps, py + ty * eps, pz + tz * eps, lod);
+      const slope = (h1 - S.h) / eps;
+      mu0 = mu0r - Math.sqrt(Math.max(0, 1 - mu0r * mu0r)) * slope * B.relief * 2.2;
+      if (mu0r <= 0) mu0 = Math.min(mu0, mu0r + 0.05);
+    }
+    let sh = 1;
+    const P0 = px * B.ra, P1 = py * B.rb, P2 = pz * B.rc;
+    let red = 0;
+    for (let k = 0; k < B.occ.length; k++) {
+      const o = B.occ[k];
+      const vx = o.x - P0, vy = o.y - P1, vz = o.z - P2;
+      const tca = vx * B.sx + vy * B.sy + vz * B.sz;
+      if (tca <= 0) continue;
+      const dd = Math.sqrt(Math.max(0, vx * vx + vy * vy + vz * vz - tca * tca));
+      const ao = o.r / tca, sep = dd / tca, as = B.sunAng;
+      if (sep > ao + as) continue;
+      const lo = Math.abs(ao - as), fMin = ao > as ? 0 : 1 - ao * ao / (as * as);
+      const f2 = sep <= lo ? fMin : fMin + (1 - fMin) * (sep - lo) / (ao + as - lo);
+      if (o.atmo && f2 < 0.3) red = Math.max(red, 1 - f2 / 0.3);
+      sh *= f2;
+    }
+    if (B.rings && B.sz !== 0) {
+      const s = -P2 / B.sz;
+      if (s > 0) {
+        const rx = P0 + s * B.sx, ry = P1 + s * B.sy;
+        ringSample(B.rings, Math.hypot(rx, ry), 200, Math.atan2(ry, rx), this.days, this.RS);
+        sh *= 1 - this.RS.a * 0.92;
+      }
+    }
+    const tw = B.twilight;
+    const m0 = tw > 0 ? clamp((mu0 + tw) / (1 + tw), 0, 1) * smoothstep(-tw, tw * 0.6, mu0) : Math.max(0, mu0);
+    let f;
+    if (b.id === "earth") {
+      const cl = S.c;
+      const land = m0;
+      const cloud = m0 > 0 ? Math.pow(m0, 0.9) * Math.pow(mu, -0.1) : 0;
+      ar = ar * (1 - cl) * land + 0.92 * cl * cloud;
+      ag = ag * (1 - cl) * land + 0.93 * cl * cloud;
+      ab = ab * (1 - cl) * land + 0.96 * cl * cloud;
+      f = 1;
+      if (S.spec && m0 > 0) {
+        const hx = B.sx - dx, hy = B.sy - dy, hz = B.sz - dz, hl = Math.hypot(hx, hy, hz);
+        const nh = Math.max(0, (nx * hx + ny * hy + nz * hz) / hl);
+        const fres = 0.3 + 0.7 * Math.pow(1 - mu, 5);
+        const sp = Math.pow(nh, 90) * 2.2 * fres * (1 - cl) + Math.pow(nh, 12) * 0.05;
+        ar += sp;
+        ag += sp * 0.95;
+        ab += sp * 0.85;
+      }
+    } else if (B.minn > 0) {
+      f = m0 > 0 ? Math.pow(m0, B.minn) * Math.pow(mu, B.minn - 1) : 0;
+    } else {
+      f = m0 > 0 ? B.ls * (2 * m0) / (m0 + mu) + (1 - B.ls) * m0 : 0;
+      if (B.look.metal) f *= 1 + B.look.metal * Math.pow(Math.max(0, m0 + mu - 1), 3);
+    }
+    const L = B.light * sh * f;
+    let r = ar * L * SUN_COL[0], g = ag * L * SUN_COL[1], bl = ab * L * SUN_COL[2];
+    if (red > 0) {
+      const k = red * 0.06 * B.light * Math.max(0, m0 > 0 ? 1 : 0);
+      r += ar * k * 1.4;
+      g += ag * k * 0.35;
+      bl += ab * k * 0.15;
+    }
+    r += ar * B.amb;
+    g += ag * B.amb;
+    bl += ab * B.amb;
+    let glow = 0;
+    if (b.id === "earth" && S.l > 0.01) {
+      const night = smoothstep(0.1, -0.12, mu0r);
+      const e = S.l * night * (1 - S.c * 0.85) * 0.8;
+      r += e * 1;
+      g += e * 0.7;
+      bl += e * 0.34;
+      glow = e * 0.8;
+      if (e > 0.25) kind = K.UI;
+    } else if (S.emit > 0) {
+      const e = S.emit * (0.25 + 0.75 * smoothstep(0.1, -0.1, mu0r)) * 0.9;
+      r += e;
+      g += e * 0.32;
+      bl += e * 0.08;
+      glow = e * 0.7;
+    }
+    res.r = r;
+    res.g = g;
+    res.b = bl;
+    res.kind = kind;
+    res.glow = glow;
+  }
+  // Single scattering through the atmosphere from t0 to t1 (km along the ray). Results in this.A.
+  atmosphere(ox, oy, oz, sx, sy, sz, dx, dy, dz, t0, t1) {
+    const B = this.B, at = B.atm, A = this.A;
+    const comps = at.comps, nc = comps.length, Rkm = B.ra;
+    const cosT = dx * B.sx + dy * B.sy + dz * B.sz;
+    const len2 = t1 - t0;
+    let hmin = Infinity;
+    for (const c of comps) hmin = Math.min(hmin, c.H);
+    const n = Math.max(4, Math.min(at.dense ? 16 : 11, Math.ceil(len2 / (hmin * 3)) + 3));
+    const dsU = len2 / n, NMAX = at.dense ? 28 : 14;
+    let ePrev = 0;
+    {
+      const qx = ox + t0 * sx, qy = oy + t0 * sy, qz = oz + t0 * sz;
+      const h0 = Math.max(0, (Math.hypot(qx, qy, qz) - 1) * Rkm);
+      for (let k = 0; k < nc; k++) {
+        const c = comps[k];
+        if (!c.layer) ePrev += Math.exp(-h0 / c.H) * (c.br + c.ar);
+      }
+    }
+    let tcur = t0;
+    let tr = 1, tg = 1, tb = 1, ir = 0, ig = 0, ib = 0;
+    const phR = 0.75 * (1 + cosT * cosT);
+    const PH = this.PH || (this.PH = new Float64Array(24));
+    for (let k = 0; k < nc; k++) {
+      const c = comps[k];
+      if (!c.layer && c.ray) {
+        PH[k * 3] = PH[k * 3 + 1] = PH[k * 3 + 2] = phR;
+        continue;
+      }
+      const gr = c.layer ? c.g : c.gr, gg = c.layer ? c.g : c.gg, gb = c.layer ? c.g : c.gb;
+      PH[k * 3] = hg(gr, cosT);
+      PH[k * 3 + 1] = gg === gr ? PH[k * 3] : hg(gg, cosT);
+      PH[k * 3 + 2] = gb === gr ? PH[k * 3] : hg(gb, cosT);
+      if (c.ms) for (let q = 0; q < 3; q++) PH[k * 3 + q] = PH[k * 3 + q] * (1 - c.ms) + c.ms;
+    }
+    for (let i = 0; i < NMAX && tcur < t1 - 1e-9; i++) {
+      let ds = ePrev > 0 ? Math.min(dsU, Math.max(dsU * 0.03, 0.45 / ePrev)) : dsU;
+      if (tcur + ds > t1 || i === NMAX - 1) ds = t1 - tcur;
+      const t = tcur + ds * 0.5;
+      tcur += ds;
+      const qx = ox + t * sx, qy = oy + t * sy, qz = oz + t * sz;
+      const r = Math.hypot(qx, qy, qz);
+      const h = Math.max(0, (r - 1) * Rkm);
+      const mus = (qx * B.sx + qy * B.sy + qz * B.sz) / r;
+      const lit = mus > -Math.sqrt(Math.max(0, 1 - 1 / (r * r))) ? 1 : 0;
+      let er = 0, eg = 0, eb = 0, sr = 0, sg = 0, sb = 0, osr = 0, osg = 0, osb = 0;
+      for (let k = 0; k < nc; k++) {
+        const c = comps[k];
+        let rho, col;
+        if (c.layer) {
+          const z = (h - c.h0) / c.w;
+          rho = Math.exp(-z * z);
+          col = rho * c.w * 1.5;
+        } else {
+          rho = Math.exp(-h / c.H);
+          col = lit ? rho * c.H * chapman(r * Rkm / c.H, mus) : 0;
+        }
+        if (rho < 1e-7) continue;
+        er += rho * (c.br + c.ar);
+        eg += rho * (c.bg + c.ag);
+        eb += rho * (c.bb + c.ab);
+        if (lit) {
+          osr += col * (c.br + c.ar);
+          osg += col * (c.bg + c.ag);
+          osb += col * (c.bb + c.ab);
+          sr += rho * c.br * PH[k * 3];
+          sg += rho * c.bg * PH[k * 3 + 1];
+          sb += rho * c.bb * PH[k * 3 + 2];
+        }
+      }
+      const xr = Math.exp(-er * ds), xg = Math.exp(-eg * ds), xb = Math.exp(-eb * ds);
+      if (lit) {
+        ir += tr * sr * Math.exp(-osr) * (er > 1e-9 ? (1 - xr) / er : ds);
+        ig += tg * sg * Math.exp(-osg) * (eg > 1e-9 ? (1 - xg) / eg : ds);
+        ib += tb * sb * Math.exp(-osb) * (eb > 1e-9 ? (1 - xb) / eb : ds);
+      }
+      if (at.aurora && h > 90 && h < 400 && mus < 0.1) {
+        const e = this.aurora(at.aurora, qx / r, qy / r, qz / r, h) * smoothstep(0.1, -0.15, mus);
+        if (e > 0) {
+          const k = e * ds * tr;
+          ir += k * at.aurora.col[0] * (h > 220 ? 0.4 : 1) + (h > 220 ? k * at.aurora.col2[0] : 0);
+          ig += k * at.aurora.col[1] * (h > 220 ? 0.3 : 1);
+          ib += k * at.aurora.col[2] * (h > 220 ? 0.4 : 1) + (h > 220 ? k * at.aurora.col2[2] * 0.5 : 0);
+        }
+      }
+      tr *= xr;
+      tg *= xg;
+      tb *= xb;
+      ePrev = Math.max(er, eg, eb);
+      if (tr + tg + tb < 3e-3) break;
+    }
+    const L = B.light * 1.6;
+    A.r = ir * L * SUN_COL[0];
+    A.g = ig * L * SUN_COL[1];
+    A.b = ib * L * SUN_COL[2];
+    A.tr = tr;
+    A.tg = tg;
+    A.tb = tb;
+  }
+  // Auroral ovals round the geomagnetic poles, in vertical curtains.
+  aurora(a, px, py, pz, h) {
+    const c = px * a.v[0] + py * a.v[1] + pz * a.v[2];
+    const ml = Math.asin(Math.abs(clamp(c, -1, 1))) / DEG;
+    const w = Math.exp(-((ml - a.lat) * (ml - a.lat)) / 6);
+    if (w < 0.02) return 0;
+    const curtain = 0.5 + 0.5 * noise3(px * 60, py * 60, pz * 60 + this.time * 0.3);
+    const vert = h < 110 ? smoothstep(90, 110, h) : Math.exp(-(h - 110) / 60);
+    return w * curtain * curtain * vert * 4e-3;
+  }
+  // Enceladus' south polar plume: icy spray, brightest when backlit.
+  plume(ox, oy, oz, sx, sy, sz, dx, dy, dz, tmax) {
+    const B = this.B;
+    const wx = ox, wy = oy;
+    const a = sx * sx + sy * sy;
+    if (a < 1e-12) return 0;
+    let t = -(wx * sx + wy * sy) / a;
+    if (t < 0) t = 0;
+    if (t > tmax) t = tmax;
+    const px = ox + t * sx, py = oy + t * sy, pz = oz + t * sz;
+    if (pz > -0.9) return 0;
+    const hgt = -pz - 1;
+    const rho = Math.hypot(px, py);
+    const width = 0.06 + 0.3 * hgt;
+    const dens = Math.exp(-hgt / 1.1) * Math.exp(-(rho * rho) / (width * width));
+    const path = width * 1.7 / Math.sqrt(a) * B.ra;
+    const back = Math.max(0, dx * B.sx + dy * B.sy + dz * B.sz);
+    const lit = pz < 0 && B.sz < 0.2 ? 1 : 0.6;
+    return dens * path * 12e-5 * (0.1 + 6 * Math.pow(back, 6)) * B.light * lit;
+  }
+  // Lumpy small bodies: a radius map around the ellipsoid, intersected by marching.
+  shapeFor(b) {
+    let s = this.shapes.get(b.id);
+    if (s) return s;
+    const W = 96, H = 48;
+    const r = new Float32Array(W * H);
+    const paint = this.baker.painter(b);
+    const o = {
+      r: 0,
+      g: 0,
+      b: 0,
+      h: 0,
+      m: 0,
+      c: 0,
+      l: 0,
+      f: 0
+    };
+    const sh = b.shape;
+    let rmin = 9, rmax = 0;
+    const p = [
+      0,
+      0,
+      0
+    ];
+    for (let y = 0; y < H; y++) {
+      const lat = 90 - (y + 0.5) * 180 / H;
+      for (let x = 0; x < W; x++) {
+        const lon = -180 + (x + 0.5) * 360 / W;
+        p[0] = Math.cos(lat * DEG) * Math.cos(lon * DEG);
+        p[1] = Math.cos(lat * DEG) * Math.sin(lon * DEG);
+        p[2] = Math.sin(lat * DEG);
+        o.h = 0;
+        paint(p, lat, lon, o);
+        const n = fbm3(p[0] * sh.freq + sh.seed, p[1] * sh.freq, p[2] * sh.freq, 4);
+        const v = 1 + sh.amp * n + clamp(o.h, -0.2, 0.2) * 2.5;
+        r[y * W + x] = v;
+        rmin = Math.min(rmin, v);
+        rmax = Math.max(rmax, v);
+      }
+    }
+    s = {
+      W,
+      H,
+      r,
+      rmin: rmin - 0.01,
+      rmax: rmax + 0.01,
+      hit: {
+        t: 0,
+        qx: 0,
+        qy: 0,
+        qz: 0,
+        nx: 0,
+        ny: 0,
+        nz: 0
+      }
+    };
+    this.shapes.set(b.id, s);
+    return s;
+  }
+  shapeR(s, x, y, z) {
+    const l = Math.hypot(x, y, z) || 1;
+    const lat = Math.asin(clamp(z / l, -1, 1)), lon = Math.atan2(y, x);
+    let u = (lon / TAU + 0.5) * s.W - 0.5, v = (0.5 - lat / Math.PI) * s.H - 0.5;
+    u -= Math.floor(u / s.W) * s.W;
+    if (v < 0) v = 0;
+    else if (v > s.H - 1.001) v = s.H - 1.001;
+    const x0 = Math.floor(u), y0 = Math.floor(v), fu = u - x0, fv = v - y0, x1 = x0 + 1 >= s.W ? 0 : x0 + 1;
+    const R = s.r, W = s.W;
+    return (R[y0 * W + x0] * (1 - fu) + R[y0 * W + x1] * fu) * (1 - fv) + (R[(y0 + 1) * W + x0] * (1 - fu) + R[(y0 + 1) * W + x1] * fu) * fv;
+  }
+  marchShape(ox, oy, oz, sx, sy, sz, A, Bq) {
+    const s = this.B.shape, oo = this.B.oo;
+    const dOut = Bq * Bq - A * (oo - s.rmax * s.rmax);
+    if (dOut < 0) return null;
+    const sq = Math.sqrt(dOut);
+    let ta = (-Bq - sq) / A, tb = (-Bq + sq) / A;
+    if (tb <= 0) return null;
+    if (ta < 0) ta = 0;
+    const dIn = Bq * Bq - A * (oo - s.rmin * s.rmin);
+    if (dIn >= 0) {
+      const ti = (-Bq - Math.sqrt(dIn)) / A;
+      if (ti > ta) tb = Math.min(tb, ti + 1e-9);
+    }
+    const N = 16;
+    const f = (t2) => {
+      const x = ox + t2 * sx, y = oy + t2 * sy, z = oz + t2 * sz;
+      return Math.hypot(x, y, z) - this.shapeR(s, x, y, z);
+    };
+    let t0 = ta, f0 = f(ta);
+    if (f0 < 0) return null;
+    let found = false, t1 = tb, f1 = 0;
+    for (let k = 1; k <= N; k++) {
+      const t2 = ta + (tb - ta) * k / N;
+      const fv = f(t2);
+      if (fv < 0) {
+        t1 = t2;
+        f1 = fv;
+        found = true;
+        break;
+      }
+      t0 = t2;
+      f0 = fv;
+    }
+    if (!found) {
+      if (dIn < 0) return null;
+      t1 = tb;
+      f1 = f(tb);
+      if (f1 > 0) return null;
+    }
+    for (let k = 0; k < 6; k++) {
+      const tm = t0 + (t1 - t0) * clamp(f0 / (f0 - f1), 0.1, 0.9);
+      const fm = f(tm);
+      if (fm < 0) {
+        t1 = tm;
+        f1 = fm;
+      } else {
+        t0 = tm;
+        f0 = fm;
+      }
+    }
+    const t = (t0 + t1) / 2;
+    const h = s.hit;
+    h.t = t;
+    h.qx = ox + t * sx;
+    h.qy = oy + t * sy;
+    h.qz = oz + t * sz;
+    const e = 0.02;
+    const F0 = Math.hypot(h.qx, h.qy, h.qz) - this.shapeR(s, h.qx, h.qy, h.qz);
+    const fxp = Math.hypot(h.qx + e, h.qy, h.qz) - this.shapeR(s, h.qx + e, h.qy, h.qz) - F0;
+    const fyp = Math.hypot(h.qx, h.qy + e, h.qz) - this.shapeR(s, h.qx, h.qy + e, h.qz) - F0;
+    const fzp = Math.hypot(h.qx, h.qy, h.qz + e) - this.shapeR(s, h.qx, h.qy, h.qz + e) - F0;
+    const nx = fxp / this.B.ra, ny = fyp / this.B.rb, nz = fzp / this.B.rc;
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    h.nx = nx / nl;
+    h.ny = ny / nl;
+    h.nz = nz / nl;
+    return h;
+  }
+  // ---- orbit lines --------------------------------------------------------------------------------
+  drawOrbits(opts) {
+    const sys = this.sys, cam = this.cam;
+    const show = [];
+    const frame = opts.frame;
+    const sysRoot = frame ? frame.kind === "moon" ? frame.parentBody : frame : null;
+    for (const b of sys.bodies) {
+      if (!b.orbit) continue;
+      const planetish = b.parentBody && b.parentBody.id === "sun" && (b.kind === "planet" || b.kind === "dwarf" || b === opts.target);
+      const moonHere = b.parentBody && sysRoot && b.parentBody === sysRoot;
+      if (!planetish && !moonHere && b !== opts.target && !(b.belt && opts.target && opts.target.belt)) continue;
+      show.push(b);
+    }
+    const P0 = [
+      0,
+      0,
+      0
+    ], P1 = [
+      0,
+      0,
+      0
+    ];
+    for (const b of show) {
+      let c = this.orbitCache.get(b.id);
+      const period = b.orbit.lunar ? 27.32 : b.n ? TAU / b.n : 365;
+      if (!c || Math.abs(c.jd - sys.jd) > Math.min(period * 0.01, 30)) {
+        c = {
+          jd: sys.jd,
+          pts: sys.orbitPath(b, 360)
+        };
+        this.orbitCache.set(b.id, c);
+      }
+      const pts = c.pts;
+      if (!pts) continue;
+      const par = b.parentBody;
+      const center = par.bary || par.pos;
+      const base = par.id === "sun" ? [
+        0,
+        0,
+        0
+      ] : center;
+      const col = b.look.col || [
+        0.6,
+        0.6,
+        0.6
+      ];
+      const isT = b === opts.target;
+      const k = isT ? 0.75 : 0.38;
+      const cr = col[0] * k + 0.05, cg = col[1] * k + 0.05, cb = col[2] * k + 0.08;
+      const n = pts.length / 3;
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        const ax = base[0] + pts[i * 3] - cam.pos[0], ay = base[1] + pts[i * 3 + 1] - cam.pos[1], az = base[2] + pts[i * 3 + 2] - cam.pos[2];
+        const bx = base[0] + pts[j * 3] - cam.pos[0], by = base[1] + pts[j * 3 + 1] - cam.pos[1], bz = base[2] + pts[j * 3 + 2] - cam.pos[2];
+        this.line3(ax, ay, az, bx, by, bz, cr, cg, cb, P0, P1);
+      }
+    }
+  }
+  line3(ax, ay, az, bx, by, bz, r, g, b, P0, P1) {
+    const cam = this.cam, F = cam.fwd;
+    let za = ax * F[0] + ay * F[1] + az * F[2], zb = bx * F[0] + by * F[1] + bz * F[2];
+    const near = 1e-3;
+    if (za < near && zb < near) return;
+    if (za < near) {
+      const t = (near - za) / (zb - za);
+      ax += (bx - ax) * t;
+      ay += (by - ay) * t;
+      az += (bz - az) * t;
+      za = near;
+    }
+    if (zb < near) {
+      const t = (near - zb) / (za - zb);
+      bx += (ax - bx) * t;
+      by += (ay - by) * t;
+      bz += (az - bz) * t;
+      zb = near;
+    }
+    this.project(ax, ay, az, P0);
+    this.project(bx, by, bz, P1);
+    const x0 = P0[0], y0 = P0[1], x1 = P1[0], y1 = P1[1];
+    const dx = x1 - x0, dy = y1 - y0;
+    if (x0 < 0 && x1 < 0 || y0 < 0 && y1 < 0 || x0 >= this.cols && x1 >= this.cols || y0 >= this.rows && y1 >= this.rows) return;
+    const steps = Math.min(4e3, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy) * 1)) + 1);
+    const ang = Math.atan2(-dy, dx * this.aspect + 1e-9);
+    let gch;
+    const a = (ang / DEG + 180) % 180;
+    if (a < 25 || a >= 155) gch = G_DASH;
+    else if (a < 65) gch = G_SLASH;
+    else if (a < 115) gch = G_BAR;
+    else gch = G_BSL;
+    if (steps > 3e3) return;
+    const grid = this.grid, cols = this.cols;
+    const da = Math.hypot(ax, ay, az), db = Math.hypot(bx, by, bz);
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      const x = Math.floor(x0 + dx * t), y = Math.floor(y0 + dy * t);
+      if (x < 0 || y < 0 || x >= cols || y >= this.rows) continue;
+      const i = y * cols + x;
+      const dep = da + (db - da) * t;
+      if (grid.depth[i] < dep) continue;
+      const k3 = i * 3;
+      if (grid.ch[i] !== 32 && grid.kind[i] !== K.DUST && grid.kind[i] !== K.SPACE) continue;
+      grid.ch[i] = steps < 2 ? G_DOT : gch;
+      grid.fg[k3] = r;
+      grid.fg[k3 + 1] = g;
+      grid.fg[k3 + 2] = b;
+      grid.kind[i] = K.SPACE;
+    }
+  }
+  // ---- flight effects -------------------------------------------------------------------------------
+  effects(opts) {
+    const fx = opts.fx;
+    if (!fx) return;
+    const g = this.grid, { cols, rows } = this;
+    if (fx.heat > 0.01) {
+      const h = Math.min(1, fx.heat);
+      const T = this.time;
+      for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+        const u = (x + 0.5) / cols - 0.5, v = ((y + 0.5) / rows - 0.5) * (rows / cols) / this.aspect;
+        const r = Math.hypot(u, v) * 2;
+        const a = Math.atan2(v, u);
+        const fl = 0.6 + 0.4 * noise3(Math.cos(a) * 4, Math.sin(a) * 4, T * 3 - r * 4);
+        const I = h * smoothstep(0.3 - h * 0.25, 1.1, r) * fl * 0.9;
+        if (I < 0.01) continue;
+        const i = y * cols + x, k3 = i * 3;
+        const hot = Math.min(1, I * 1.5);
+        g.bg[k3] += I * 1.2;
+        g.bg[k3 + 1] += I * (0.35 + 0.45 * hot);
+        g.bg[k3 + 2] += I * (0.15 + 0.5 * hot * hot);
+        g.glow[i] = Math.max(g.glow[i], Math.min(0.8, I));
+      }
+      const n = Math.floor(40 + 160 * h);
+      for (let k = 0; k < n; k++) {
+        const a = hashf(k, 7) * TAU, sp = 0.6 + hashf(k, 9) * 1.2;
+        const r = (hashf(k, 3) + T * sp * (0.8 + h)) % 1 * 1.2 + 0.15;
+        const x = Math.floor(cols / 2 + Math.cos(a) * r * cols * 0.5), y = Math.floor(rows / 2 + Math.sin(a) * r * rows * 0.5);
+        if (x < 0 || y < 0 || x >= cols || y >= rows) continue;
+        const i = y * cols + x, k3 = i * 3;
+        const deg = (Math.atan2(-Math.sin(a) * rows, Math.cos(a) * cols * this.aspect) / DEG + 180) % 180;
+        g.ch[i] = deg < 25 || deg >= 155 ? G_DASH : deg < 65 ? G_SLASH : deg < 115 ? G_BAR : G_BSL;
+        const I = h * (0.6 + 0.6 * hashf(k, 5));
+        g.fg[k3] = 1.6 * I + 0.2;
+        g.fg[k3 + 1] = 0.9 * I + 0.1;
+        g.fg[k3 + 2] = 0.5 * I + 0.1;
+        g.glow[i] = Math.max(g.glow[i], 0.6 * I);
+        g.kind[i] = K.UI;
+      }
+    }
+    if (fx.streak > 0.01 && fx.vel) {
+      const sp = Math.hypot(fx.vel[0], fx.vel[1], fx.vel[2]);
+      if (sp < 1e-6) return;
+      const L = Math.max(0.02, sp * 0.35);
+      const N = 70;
+      if (!this.dust.length || Math.abs(this.dustL - L) / L > 0.6) {
+        this.dust = [];
+        for (let k = 0; k < N; k++) this.dust.push([
+          (hashf(k, 1) - 0.5) * 2 * L,
+          (hashf(k, 2) - 0.5) * 2 * L,
+          (hashf(k, 3) - 0.5) * 2 * L
+        ]);
+        this.dustL = L;
+      }
+      const dt = opts.dt || 0.016;
+      const P = [
+        0,
+        0,
+        0
+      ], Q = [
+        0,
+        0,
+        0
+      ];
+      for (const d of this.dust) {
+        d[0] -= fx.vel[0] * dt;
+        d[1] -= fx.vel[1] * dt;
+        d[2] -= fx.vel[2] * dt;
+        for (let k = 0; k < 3; k++) {
+          if (d[k] < -L) d[k] += 2 * L;
+          else if (d[k] > L) d[k] -= 2 * L;
+        }
+        if (!this.project(d[0], d[1], d[2], P)) continue;
+        if (!this.project(d[0] + fx.vel[0] * 0.05, d[1] + fx.vel[1] * 0.05, d[2] + fx.vel[2] * 0.05, Q)) continue;
+        const x = Math.floor(P[0]), y = Math.floor(P[1]);
+        if (x < 0 || y < 0 || x >= cols || y >= rows) continue;
+        const dist = Math.hypot(d[0], d[1], d[2]);
+        const I = fx.streak * clamp(1.2 - dist / L, 0, 1);
+        if (I < 0.05) continue;
+        const i = y * cols + x, k3 = i * 3;
+        const ddx = Q[0] - P[0], ddy = Q[1] - P[1];
+        const deg = (Math.atan2(-ddy, ddx * this.aspect) / DEG + 180) % 180;
+        const long = Math.hypot(ddx, ddy) > 1.2;
+        g.ch[i] = !long ? G_DOT : deg < 25 || deg >= 155 ? G_DASH : deg < 65 ? G_SLASH : deg < 115 ? G_BAR : G_BSL;
+        const c = fx.streakCol || [
+          0.9,
+          0.9,
+          0.95
+        ];
+        g.fg[k3] = c[0] * I;
+        g.fg[k3 + 1] = c[1] * I;
+        g.fg[k3 + 2] = c[2] * I;
+        g.kind[i] = K.UI;
+      }
+    }
+  }
+};
+function hg(gv, c) {
+  const g2 = gv * gv, d = 1 + g2 - 2 * gv * c;
+  return (1 - g2) / (d * Math.sqrt(d));
+}
+
+// src/mapview.js
+var G = (c) => c.charCodeAt(0);
+var MapView = class {
+  constructor() {
+    this.zoom = 1;
+    this.cx = 0;
+    this.cy = 0;
+    this.cache = /* @__PURE__ */ new Map();
+    this.focus = null;
+  }
+  // Half-width (km) of the whole-system view that frames the focus body's orbit, and of its own
+  // moon system (null if it has none worth zooming into).
+  spans(f) {
+    const helio = f.kind === "star" ? 5.5 * AU : Math.max(1.7 * AU, f.sunDist * 1.18);
+    const far = f.children.reduce((m, c) => Math.max(m, c.orbit && c.orbit.a ? c.orbit.a * (1 + (c.orbit.e || 0)) : c.orbit && c.orbit.lunar ? 405e3 : 0), 0);
+    return {
+      helio,
+      local: far ? Math.min(far, 4e7) * 1.3 : Math.max(f.Req * 40, 2e5)
+    };
+  }
+  render(g, sys, ship, font, opts) {
+    const cols = g.cols, rows = g.rows, aspect = font.cellW / font.cellH;
+    g.ch.fill(32);
+    g.fg.fill(0);
+    g.bg.fill(0);
+    g.glow.fill(0);
+    g.depth.fill(Infinity);
+    g.kind.fill(K.UI);
+    const focus = ship.target ? ship.target.kind === "moon" && ship.target.parentBody.id !== "sun" ? ship.target.parentBody : ship.target : sys.sun;
+    if (focus !== this.focus) {
+      this.focus = focus;
+      this.zoom = 1;
+    }
+    const sp = this.spans(focus);
+    const half = sp.helio / this.zoom;
+    const kmx = Math.max(half / (cols / 2), half * aspect / (rows / 2 - 2)), kmy = kmx / aspect;
+    const glide = focus.kind === "star" ? 0 : smoothstep(Math.log(1.2), Math.log(3.5), Math.log(this.zoom));
+    const fx = focus.pos[0] * glide, fy = focus.pos[1] * glide;
+    const k = opts.snap ? 1 : 1 - Math.exp(-(opts.dt || 0.016) * 6);
+    this.cx += (fx - this.cx) * k;
+    this.cy += (fy - this.cy) * k;
+    const toS = (x, y) => [
+      cols / 2 + (x - this.cx) / kmx,
+      rows / 2 - (y - this.cy) / kmy
+    ];
+    for (let i = 0; i < 400; i++) {
+      const x = i * 7919 % cols, y = i * 104729 % rows;
+      g.glyph(x, y, 46, 0.12, 0.12, 0.15);
+    }
+    for (const au of [
+      1,
+      5,
+      10,
+      20,
+      30,
+      40
+    ]) {
+      const r = au * AU;
+      if (r / kmx < 4 || r / kmx > cols * 3) continue;
+      const n = 240;
+      for (let s2 = 0; s2 < n; s2++) {
+        const a2 = s2 / n * Math.PI * 2;
+        const [x, y] = toS(Math.cos(a2) * r, Math.sin(a2) * r);
+        if (s2 % 2 === 0) this.put(g, x, y, 46, [
+          0.1,
+          0.12,
+          0.16
+        ]);
+      }
+      const [lx, ly] = toS(r * 0.707, -r * 0.707);
+      g.text(Math.floor(lx) + 1, Math.floor(ly), `${au} AU`, 0.2, 0.24, 0.3);
+    }
+    const s = sys.swarm;
+    const SC = [
+      [
+        0.26,
+        0.23,
+        0.2
+      ],
+      [
+        0.36,
+        0.29,
+        0.22
+      ],
+      [
+        0.42,
+        0.3,
+        0.2
+      ],
+      [
+        0.24,
+        0.25,
+        0.32
+      ]
+    ];
+    for (let i = 0; i < s.n; i++) {
+      const [x, y] = toS(s.pos[i * 3], s.pos[i * 3 + 1]);
+      this.put(g, x, y, 46, SC[s.type[i]], true);
+    }
+    const showMoons = focus.kind !== "star" && half < 0.5 * AU;
+    for (const b of sys.bodies) {
+      if (!b.orbit) continue;
+      const helio = b.parentBody.id === "sun";
+      if (helio && !(b.kind === "planet" || b.kind === "dwarf" || b.belt)) continue;
+      if (!helio && !(showMoons && (b.parentBody === focus || b.parentBody === focus.parentBody))) continue;
+      if (b.belt && !(b === ship.target || half < 4 * AU)) continue;
+      let c = this.cache.get(b.id);
+      const period = b.orbit.lunar ? 27.32 : b.n ? 2 * Math.PI / b.n : 365;
+      if (!c || Math.abs(c.jd - sys.jd) > Math.min(period * 0.01, 20)) {
+        c = {
+          jd: sys.jd,
+          pts: sys.orbitPath(b, 240)
+        };
+        this.cache.set(b.id, c);
+      }
+      const par = b.parentBody, base = par.id === "sun" ? [
+        0,
+        0
+      ] : par.bary || par.pos;
+      const col = b.look.col, kk = b === ship.target ? b === focus && showMoons ? 0.25 : 0.7 : b.belt ? 0.22 : 0.4;
+      const cc = [
+        col[0] * kk + 0.04,
+        col[1] * kk + 0.04,
+        col[2] * kk + 0.06
+      ];
+      const n = c.pts.length / 3;
+      let px = null, py = null;
+      for (let i = 0; i <= n; i++) {
+        const j = i % n;
+        const [x, y] = toS(base[0] + c.pts[j * 3], base[1] + c.pts[j * 3 + 1]);
+        if (px !== null) this.line(g, px, py, x, y, cc, aspect);
+        px = x;
+        py = y;
+      }
+    }
+    const labels = [];
+    for (const b of sys.bodies) {
+      const helio = !b.parentBody || b.parentBody.id === "sun";
+      if (!helio && !showMoons) continue;
+      if (!helio && b.parentBody !== focus && b.parentBody !== focus.parentBody) continue;
+      const [x, y] = toS(b.pos[0], b.pos[1]);
+      const col = b.look.col;
+      const ch = b.kind === "star" ? "@" : b.kind === "planet" ? b.Req > 2e4 ? "O" : "o" : b.kind === "dwarf" ? "o" : ".";
+      const rr = b.Req / kmx;
+      if (rr > 1.5) {
+        for (let yy = Math.floor(y - rr * aspect); yy <= Math.ceil(y + rr * aspect); yy++) for (let xx = Math.floor(x - rr); xx <= Math.ceil(x + rr); xx++) {
+          if (Math.hypot((xx + 0.5 - x) / rr, (yy + 0.5 - y) / (rr * aspect)) < 1) this.put(g, xx, yy, 35, [
+            col[0] * 1.1,
+            col[1] * 1.1,
+            col[2] * 1.1
+          ]);
+        }
+      } else this.put(g, x, y, G(ch), [
+        col[0] * 1.3 + 0.1,
+        col[1] * 1.3 + 0.1,
+        col[2] * 1.3 + 0.1
+      ], false, b.kind === "star" ? 1 : 0.25);
+      if (b.kind === "star" || b.kind === "planet" || b.kind === "dwarf" || !helio || b === ship.target || b.belt && half < 4 * AU) labels.push({
+        b,
+        x,
+        y,
+        rr
+      });
+    }
+    const w = ship.world;
+    const [sx, sy] = toS(w[0], w[1]);
+    const hx = ship.fwd[0], hy = -ship.fwd[1] * aspect;
+    const a = Math.atan2(-hy, hx) * 180 / Math.PI;
+    const arrow = Math.abs(a) < 22.5 ? ">" : Math.abs(a) > 157.5 ? "<" : a > 0 ? a < 67.5 ? "/" : a < 112.5 ? "^" : "\\" : a > -67.5 ? "\\" : a > -112.5 ? "v" : "/";
+    this.put(g, sx, sy, G(arrow), [
+      0.5,
+      1.4,
+      0.6
+    ], false, 0.6);
+    const used = new Uint8Array(cols * rows);
+    labels.sort((p, q) => (q.b === ship.target) - (p.b === ship.target) || (p.b.kind === "star" ? -1 : 0));
+    const lab = (x, y, s2, c) => {
+      x = Math.floor(x);
+      y = Math.floor(y);
+      if (y < 2 || y >= rows - 2 || x < 0 || x + s2.length >= cols) return false;
+      for (let k2 = -1; k2 <= s2.length; k2++) if (used[y * cols + x + k2]) return false;
+      for (let k2 = -1; k2 <= s2.length; k2++) used[y * cols + x + k2] = 1;
+      g.text(x, y, s2, c[0], c[1], c[2]);
+      return true;
+    };
+    const tl = labels.find((L) => L.b === ship.target);
+    if (!tl || Math.hypot(tl.x - sx, (tl.y - sy) / aspect) > 6) lab(sx + 2, sy, "YOU", [
+      0.5,
+      1,
+      0.6
+    ]);
+    for (const L of labels) {
+      const t = L.b === ship.target;
+      const c = t ? [
+        0.45,
+        0.85,
+        1
+      ] : L.b.kind === "moon" ? [
+        0.55,
+        0.6,
+        0.65
+      ] : [
+        0.8,
+        0.8,
+        0.82
+      ];
+      const gap2 = t ? 4 : 2;
+      if (!lab(L.x + Math.max(gap2, L.rr + gap2), L.y, L.b.name, c) && !lab(L.x - L.b.name.length - gap2 - L.rr, L.y, L.b.name, c)) lab(L.x - L.b.name.length / 2, L.y + L.rr * aspect + 1, L.b.name, c);
+      if (t && L.rr < 1.5) {
+        this.put(g, L.x - 2, L.y, 91, [
+          0.45,
+          0.85,
+          1
+        ]);
+        this.put(g, L.x + 2, L.y, 93, [
+          0.45,
+          0.85,
+          1
+        ]);
+      }
+    }
+    const bar = 16, km = bar * kmx;
+    const sbar = ` |${"-".repeat(bar - 2)}| ${fmtDist(km)} `;
+    g.text(cols - sbar.length - 1, rows - 3, sbar, 0.55, 0.55, 0.58);
+    const fl = ` SYSTEM MAP  ${glide > 0.5 ? `${focus.name} system` : "Sun-centred"}   wheel / Z X zoom ${this.zoom < 10 ? this.zoom.toFixed(1) : Math.round(this.zoom)}x `;
+    g.text(Math.floor((cols - fl.length) / 2), rows - 2, fl, 0.6, 0.6, 0.62);
+  }
+  put(g, x, y, ch, c, weak = false, glow = 0) {
+    x = Math.floor(x);
+    y = Math.floor(y);
+    if (x < 0 || y < 0 || x >= g.cols || y >= g.rows) return;
+    const i = y * g.cols + x;
+    if (weak && g.ch[i] !== 32 && g.ch[i] !== 46) return;
+    g.glyph(x, y, ch, c[0], c[1], c[2], glow);
+  }
+  line(g, x0, y0, x1, y1, c, aspect) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const n = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
+    if (n > 600) return;
+    const a = (Math.atan2(-dy, dx * aspect) * 180 / Math.PI + 180) % 180;
+    const ch = a < 25 || a >= 155 ? 45 : a < 65 ? 47 : a < 115 ? 124 : 92;
+    for (let s = 0; s <= n; s++) {
+      const x = Math.floor(x0 + dx * s / Math.max(1, n)), y = Math.floor(y0 + dy * s / Math.max(1, n));
+      if (x < 0 || y < 0 || x >= g.cols || y >= g.rows) continue;
+      const i = y * g.cols + x;
+      if (g.ch[i] !== 32 && g.ch[i] !== 46) continue;
+      g.glyph(x, y, n < 2 ? 46 : ch, c[0], c[1], c[2]);
+    }
+  }
+  zoomBy(f) {
+    this.zoom = clamp(this.zoom * f, 0.08, 2e4);
+  }
+};
+
+// src/ship.js
+var MAX_SPEED = 3e3 * C_KMS;
+var Ship = class {
+  constructor(sys) {
+    this.sys = sys;
+    this.frame = sys.byId.earth;
+    this.rel = [
+      0,
+      -4e4,
+      8e3
+    ];
+    this.vel = [
+      0,
+      0,
+      0
+    ];
+    this.fwd = [
+      0,
+      1,
+      0
+    ];
+    this.up = [
+      0,
+      0,
+      1
+    ];
+    this.right = [
+      1,
+      0,
+      0
+    ];
+    this.speedK = 0.5;
+    this.target = null;
+    this.auto = null;
+    this.look = null;
+    this.heat = 0;
+    this.streak = 0;
+    this.messages = [];
+    this.world = [
+      0,
+      0,
+      0
+    ];
+    this.speed = 0;
+    this.alt = Infinity;
+    this.altBody = null;
+    this.atm = null;
+    this.fov = 62 * Math.PI / 180;
+    this.ringSide = 0;
+    this.updateWorld();
+  }
+  updateWorld() {
+    const f = this.frame.pos;
+    this.world[0] = f[0] + this.rel[0];
+    this.world[1] = f[1] + this.rel[1];
+    this.world[2] = f[2] + this.rel[2];
+    return this.world;
+  }
+  setFrame(b) {
+    if (b === this.frame) return;
+    const w = this.updateWorld();
+    this.rel = [
+      w[0] - b.pos[0],
+      w[1] - b.pos[1],
+      w[2] - b.pos[2]
+    ];
+    this.frame = b;
+  }
+  // Place the camera at `dist` from body b, on its sunlit side, looking at it.
+  placeAt(b, dist, side = 0.6, elev = 0.25) {
+    const s = b.toSun;
+    let e = norm(cross(s, [
+      0,
+      0,
+      1
+    ]));
+    if (!isFinite(e[0])) e = [
+      1,
+      0,
+      0
+    ];
+    const dir = norm(add(add(mul(s, Math.cos(side)), mul(e, Math.sin(side))), [
+      0,
+      0,
+      elev
+    ]));
+    this.frame = b;
+    this.rel = mul(dir, dist);
+    this.vel = [
+      0,
+      0,
+      0
+    ];
+    this.updateWorld();
+    this.lookAt(b.pos, true);
+  }
+  lookAt(p, now) {
+    const w = this.updateWorld();
+    const d = norm(sub(p, w));
+    if (now) {
+      this.fwd = d;
+      let r = cross(d, [
+        0,
+        0,
+        1
+      ]);
+      if (len(r) < 1e-6) r = [
+        1,
+        0,
+        0
+      ];
+      this.right = norm(r);
+      this.up = cross(this.right, this.fwd);
+    } else this.look = {
+      p,
+      t: 0
+    };
+  }
+  turnToward(dir, rate) {
+    const c = clamp(dot(this.fwd, dir), -1, 1);
+    const ang = Math.acos(c);
+    if (ang < 1e-5) return true;
+    let ax = cross(this.fwd, dir);
+    if (len(ax) < 1e-9) ax = this.up;
+    ax = norm(ax);
+    const step = Math.min(ang, Math.max(ang * rate, 2e-3));
+    this.fwd = norm(rotate(this.fwd, ax, step));
+    this.up = norm(rotate(this.up, ax, step));
+    this.orthonormalize();
+    return ang < 0.01;
+  }
+  orthonormalize() {
+    this.fwd = norm(this.fwd);
+    this.right = norm(cross(this.fwd, this.up));
+    this.up = norm(cross(this.right, this.fwd));
+  }
+  // Distance at which the autopilot parks next to body b.
+  standoff(b) {
+    if (b.kind === "star") return b.Req * 14;
+    if (b.rings && b.rings.main) return b.rings.outer * 2.1;
+    const base = b.atmo ? b.Req + b.atmo.top : b.Rmax;
+    if (b.kind === "planet") return base * 3.4;
+    return Math.max(base * 3.6, 8);
+  }
+  travelTo(b) {
+    if (!b) return;
+    const w = this.updateWorld();
+    const toCam = norm(sub(w, b.pos));
+    let side = norm(add(mul(toCam, 0.5), mul(b.toSun, 0.85)));
+    side = norm(add(side, [
+      0,
+      0,
+      0.18
+    ]));
+    if (b.kind === "star") side = toCam;
+    this.auto = {
+      target: b,
+      side,
+      t: 0,
+      dist0: len(sub(b.pos, w)),
+      wp: null
+    };
+    this.target = b;
+    this.look = null;
+  }
+  cancelAuto(msg) {
+    if (!this.auto) return;
+    this.auto = null;
+    if (msg) this.messages.push(msg);
+  }
+  // Nearest surface (km above it), counting a ring plane as a surface when you are over the rings.
+  proximity() {
+    const w = this.world;
+    let best = Infinity, body = null;
+    for (const b of this.sys.bodies) {
+      const dx = w[0] - b.pos[0], dy = w[1] - b.pos[1], dz = w[2] - b.pos[2];
+      const d = Math.hypot(dx, dy, dz);
+      const s = this.surfaceR(b, dx, dy, dz, d);
+      const alt = d - s;
+      if (alt < best) {
+        best = alt;
+        body = b;
+      }
+      if (b.rings && d < b.rings.outer * 1.1) {
+        const z = dx * b.axes[2][0] + dy * b.axes[2][1] + dz * b.axes[2][2];
+        const rr = Math.sqrt(Math.max(0, d * d - z * z));
+        if (rr > b.rings.inner && rr < b.rings.outer) best = Math.min(best, Math.max(Math.abs(z), 2));
+      }
+    }
+    this.alt = best;
+    this.altBody = body;
+    return best;
+  }
+  // Radius of b's surface (cloud tops for giants) in the direction (dx, dy, dz) from its centre.
+  surfaceR(b, dx, dy, dz, d) {
+    const ax = b.axes;
+    const x = (dx * ax[0][0] + dy * ax[0][1] + dz * ax[0][2]) / d, y = (dx * ax[1][0] + dy * ax[1][1] + dz * ax[1][2]) / d, z = (dx * ax[2][0] + dy * ax[2][1] + dz * ax[2][2]) / d;
+    const r = b.radii;
+    let s = 1 / Math.sqrt(x * x / (r[0] * r[0]) + y * y / (r[1] * r[1]) + z * z / (r[2] * r[2]));
+    if (b.shape) s *= 1 + b.shape.amp * 1.3;
+    return s;
+  }
+  update(dt, input) {
+    const sys = this.sys;
+    this.updateWorld();
+    const fr = sys.frameFor(this.world);
+    if (fr !== this.frame) this.setFrame(fr);
+    this.updateWorld();
+    const look = 1;
+    if (input.mouseX || input.mouseY || input.yaw || input.pitch || input.roll) {
+      if (this.auto && (input.mouseX || input.mouseY || input.yaw || input.pitch) && this.auto.t > 0.5) this.autoLook = false;
+      const yaw = -(input.mouseX * look) - input.yaw * dt * 1.4, pitch = -(input.mouseY * look) + input.pitch * dt * 1.1;
+      if (yaw) {
+        this.fwd = rotate(this.fwd, this.up, yaw);
+      }
+      if (pitch) {
+        this.fwd = rotate(this.fwd, this.right, pitch);
+        this.up = rotate(this.up, this.right, pitch);
+      }
+      if (input.roll) {
+        this.up = rotate(this.up, this.fwd, input.roll * dt * 1.6);
+      }
+      this.orthonormalize();
+      this.look = null;
+    }
+    const prox = this.proximity();
+    if (this.auto) {
+      if (input.fwd || input.right || input.up) this.cancelAuto("Autopilot off");
+      else this.fly(dt);
+    }
+    if (!this.auto) {
+      const D = Math.max(prox, 0.05);
+      let sp = clamp(this.speedK * D, 0.02, MAX_SPEED);
+      if (input.boost) sp = Math.min(MAX_SPEED, sp * 6);
+      const want = [
+        (this.fwd[0] * input.fwd + this.right[0] * input.right + this.up[0] * input.up) * sp,
+        (this.fwd[1] * input.fwd + this.right[1] * input.right + this.up[1] * input.up) * sp,
+        (this.fwd[2] * input.fwd + this.right[2] * input.right + this.up[2] * input.up) * sp
+      ];
+      const k = 1 - Math.exp(-dt * (input.brake ? 9 : 3.2));
+      for (let i = 0; i < 3; i++) this.vel[i] += (want[i] - this.vel[i]) * k;
+      const v = len(this.vel), lim = Math.max(sp, this.speedK * D * 6 * (input.boost ? 6 : 1));
+      if (v > lim) this.vel = mul(this.vel, lim / v);
+      for (let i = 0; i < 3; i++) this.rel[i] += this.vel[i] * dt;
+      if (this.look) {
+        this.look.t += dt;
+        const d = norm(sub(this.look.p.pos || this.look.p, this.updateWorld()));
+        if (this.turnToward(d, 1 - Math.exp(-dt * 5)) || this.look.t > 3) this.look = null;
+      }
+    }
+    this.collide();
+    this.updateWorld();
+    this.speed = len(this.vel);
+    this.atmosphereFx(dt);
+    this.ringCrossing();
+  }
+  fly(dt) {
+    const a = this.auto, b = a.target;
+    a.t += dt;
+    const w = this.updateWorld();
+    const sOff = this.standoff(b);
+    const goal = add(b.pos, mul(a.side, sOff));
+    let aim = goal;
+    const obstacles = [
+      b,
+      this.sys.sun
+    ];
+    for (const o of obstacles) {
+      const seg = sub(aim, w), sl = len(seg);
+      if (sl < 1) continue;
+      const u2 = mul(seg, 1 / sl);
+      const oc = sub(o.pos, w);
+      const tca = dot(oc, u2);
+      if (tca <= 0 || tca >= sl) continue;
+      const closest = sub(oc, mul(u2, tca));
+      const dmin = len(closest);
+      const safe = o.kind === "star" ? o.Req * 4 : o.boundR * 1.3;
+      if (dmin < safe) {
+        const away = dmin > 1e-6 ? mul(closest, -1 / dmin) : norm(cross(u2, [
+          0,
+          0,
+          1
+        ]));
+        aim = add(o.pos, mul(away, safe * 1.6));
+        break;
+      }
+    }
+    const v = sub(aim, w), dist = len(v);
+    const total = len(sub(goal, w));
+    const ease = smoothstep(0, 1.4, a.t);
+    let sp = Math.max(total * 1.35, 0.4) * (0.08 + 0.92 * ease);
+    sp = Math.min(sp, MAX_SPEED * 0.5);
+    const step = Math.min(dist, sp * dt);
+    const u = dist > 0 ? mul(v, 1 / dist) : [
+      0,
+      0,
+      0
+    ];
+    for (let i = 0; i < 3; i++) this.rel[i] += u[i] * step;
+    this.vel = mul(u, step / Math.max(dt, 1e-6));
+    if (this.autoLook !== false) this.turnToward(norm(sub(b.pos, this.updateWorld())), 1 - Math.exp(-dt * 2.6));
+    if (total < Math.max(0.02 * sOff, 0.3) || total < sOff * 0.08 && a.t > 40) {
+      this.auto = null;
+      this.autoLook = true;
+      this.vel = [
+        0,
+        0,
+        0
+      ];
+      this.messages.push(`Arrived at ${b.name}: ${fmtDist(len(sub(b.pos, this.updateWorld())) - b.Req)} above the ${b.atmo && (b.look.ramp === 3 || b.look.ramp === 6) ? "cloud tops" : "surface"}`);
+      this.look = {
+        p: b,
+        t: 0
+      };
+    }
+  }
+  collide() {
+    for (const b of [
+      this.frame,
+      ...this.frame.children,
+      this.frame.parentBody
+    ].filter(Boolean)) {
+      const w = this.updateWorld();
+      const dx = w[0] - b.pos[0], dy = w[1] - b.pos[1], dz = w[2] - b.pos[2];
+      const d = Math.hypot(dx, dy, dz);
+      if (d > b.Rmax * 2 + b.minAlt * 2) continue;
+      const s = this.surfaceR(b, dx, dy, dz, d) + b.minAlt;
+      if (d < s) {
+        const n = [
+          dx / d,
+          dy / d,
+          dz / d
+        ];
+        const push = s - d;
+        for (let i = 0; i < 3; i++) this.rel[i] += n[i] * push;
+        const vn = dot(this.vel, n);
+        if (vn < 0) this.vel = sub(this.vel, mul(n, vn * 1.1));
+        if (!this.floorT || performance.now() - this.floorT > 4e3) {
+          this.messages.push(b.atmo ? `Holding at ${Math.round(b.minAlt)} km: the ${b.name} atmosphere is too thick to go deeper` : `Surface proximity: holding ${fmtDist(b.minAlt)} above ${b.name}`);
+          this.floorT = performance.now();
+        }
+      }
+    }
+  }
+  atmosphereFx(dt) {
+    let heat = 0, streak = 0, info2 = null;
+    const w = this.world;
+    for (const b of [
+      this.frame,
+      this.frame.parentBody
+    ].filter(Boolean)) {
+      if (!b.atmo) continue;
+      const dx = w[0] - b.pos[0], dy = w[1] - b.pos[1], dz = w[2] - b.pos[2];
+      const d = Math.hypot(dx, dy, dz);
+      const h = d - this.surfaceR(b, dx, dy, dz, d);
+      if (h > b.atmo.top * 1.5) continue;
+      const c0 = b.atmo.comps[0];
+      const rho = Math.exp(-h / c0.H);
+      const v = this.speed;
+      heat = clamp(rho * Math.pow(v / 4, 3) * 0.3, 0, 1.3);
+      streak = clamp(rho * 40, 0, 1) * (v > 0.2 ? 1 : 0);
+      info2 = {
+        body: b,
+        h,
+        P: b.atmo.P0 * rho,
+        rho
+      };
+    }
+    for (const b of [
+      this.frame,
+      this.frame.parentBody
+    ].filter(Boolean)) {
+      if (!b.rings || !b.rings.main) continue;
+      const dx = w[0] - b.pos[0], dy = w[1] - b.pos[1], dz = w[2] - b.pos[2];
+      const z = dx * b.axes[2][0] + dy * b.axes[2][1] + dz * b.axes[2][2];
+      const rr = Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z));
+      if (rr > 74e3 && rr < 141e3) streak = Math.max(streak, clamp(1 - Math.abs(z) / 400, 0, 1));
+    }
+    this.atm = info2;
+    this.heat += (heat - this.heat) * (1 - Math.exp(-dt * 2.5));
+    this.streak += (streak - this.streak) * (1 - Math.exp(-dt * 3));
+  }
+  ringCrossing() {
+    const w = this.world;
+    for (const b of [
+      this.frame,
+      this.frame.parentBody
+    ].filter(Boolean)) {
+      if (!b.rings || !b.rings.main) continue;
+      const dx = w[0] - b.pos[0], dy = w[1] - b.pos[1], dz = w[2] - b.pos[2];
+      const z = dx * b.axes[2][0] + dy * b.axes[2][1] + dz * b.axes[2][2];
+      const rr = Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z));
+      const side = Math.sign(z);
+      if (this.ringSide && side !== this.ringSide && rr > 66900 && rr < 141e3) {
+        const name = rr < 74500 ? "D ring" : rr < 92e3 ? "C ring" : rr < 117580 ? "B ring" : rr < 122170 ? "Cassini Division" : rr < 136800 ? Math.abs(rr - 133583) < 200 ? "Encke Gap" : "A ring" : "F ring";
+        this.messages.push(`Crossing the ${name}, ${Math.round(rr).toLocaleString("en-US")} km from Saturn`);
+      }
+      this.ringSide = side;
+      return;
+    }
+    this.ringSide = 0;
+  }
+  // Short description of where the camera is.
+  region() {
+    const sys = this.sys, w = this.world;
+    const r = Math.hypot(w[0], w[1], w[2]) / AU;
+    const f = this.frame;
+    if (this.atm && this.atm.h < this.atm.body.atmo.top) return {
+      title: `UPPER ATMOSPHERE OF ${this.atm.body.name.toUpperCase()}`,
+      sub: this.atm.body.atmo.label
+    };
+    if (f.kind !== "star") {
+      const sysName = f.kind === "moon" ? `${f.name}, ${f.parentBody.name} system` : f.children.length ? `${f.name} system` : f.name;
+      return {
+        title: `NEAR ${f.name.toUpperCase()}`,
+        sub: sysName
+      };
+    }
+    let zone = "interplanetary space";
+    if (r < 0.3) zone = "close to the Sun";
+    else if (r < 1.8) zone = "inner Solar System";
+    else if (r < 2.1) zone = "inner edge of the asteroid belt";
+    else if (r < 3.3) zone = "main asteroid belt";
+    else if (r < 3.7) zone = "outer asteroid belt";
+    else if (r < 4.3) zone = "Hilda asteroids";
+    else if (r < 6) {
+      const j = sys.byId.jupiter.pos;
+      const a = Math.atan2(w[1], w[0]) - Math.atan2(j[1], j[0]);
+      const da = (a / Math.PI * 180 + 540) % 360 - 180;
+      zone = Math.abs(Math.abs(da) - 60) < 25 ? da > 0 ? "Jupiter Trojans (L4, the Greek camp)" : "Jupiter Trojans (L5, the Trojan camp)" : "near Jupiter's orbit";
+    } else if (r < 29) zone = "outer Solar System";
+    else if (r < 50) zone = "Kuiper belt";
+    else if (r < 120) zone = "scattered disc";
+    else zone = "beyond the heliopause";
+    return {
+      title: "HELIOCENTRIC SPACE",
+      sub: `${r.toFixed(r < 10 ? 2 : 1)} AU from the Sun, ${zone}`
+    };
+  }
+};
+
+// src/hud.js
+var INK = [
+  0.93,
+  0.9,
+  0.82
+];
+var AMBER = [
+  1,
+  0.72,
+  0.3
+];
+var DIM = [
+  0.55,
+  0.55,
+  0.56
+];
+var PANEL = [
+  0.012,
+  0.014,
+  0.022
+];
+var CYAN = [
+  0.45,
+  0.85,
+  1
+];
+var GREEN = [
+  0.5,
+  0.95,
+  0.6
+];
+var TIME_RATES = [
+  [
+    1,
+    "real time"
+  ],
+  [
+    10,
+    "10 s/s"
+  ],
+  [
+    60,
+    "1 min/s"
+  ],
+  [
+    600,
+    "10 min/s"
+  ],
+  [
+    3600,
+    "1 h/s"
+  ],
+  [
+    21600,
+    "6 h/s"
+  ],
+  [
+    86400,
+    "1 day/s"
+  ],
+  [
+    604800,
+    "1 week/s"
+  ],
+  [
+    2629800,
+    "1 month/s"
+  ],
+  [
+    31557600,
+    "1 year/s"
+  ]
+];
+var FIG = {
+  A: [
+    "    _    ",
+    "   / \\   ",
+    "  / _ \\  ",
+    " / ___ \\ ",
+    "/_/   \\_\\"
+  ],
+  S: [
+    " ____  ",
+    "/ ___| ",
+    "\\___ \\ ",
+    " ___) |",
+    "|____/ "
+  ],
+  C: [
+    "  ____ ",
+    " / ___|",
+    "| |    ",
+    "| |___ ",
+    " \\____|"
+  ],
+  I: [
+    " ___ ",
+    "|_ _|",
+    " | | ",
+    " | | ",
+    "|___|"
+  ],
+  O: [
+    "  ___  ",
+    " / _ \\ ",
+    "| | | |",
+    "| |_| |",
+    " \\___/ "
+  ],
+  L: [
+    " _     ",
+    "| |    ",
+    "| |    ",
+    "| |___ ",
+    "|_____|"
+  ],
+  R: [
+    " ____  ",
+    "|  _ \\ ",
+    "| |_) |",
+    "|  _ < ",
+    "|_| \\_\\"
+  ],
+  Y: [
+    "__   __",
+    "\\ \\ / /",
+    " \\ V / ",
+    "  | |  ",
+    "  |_|  "
+  ],
+  T: [
+    " _____ ",
+    "|_   _|",
+    "  | |  ",
+    "  | |  ",
+    "  |_|  "
+  ],
+  E: [
+    " _____ ",
+    "| ____|",
+    "|  _|  ",
+    "| |___ ",
+    "|_____|"
+  ],
+  M: [
+    " __  __ ",
+    "|  \\/  |",
+    "| |\\/| |",
+    "| |  | |",
+    "|_|  |_|"
+  ],
+  " ": [
+    "    ",
+    "    ",
+    "    ",
+    "    ",
+    "    "
+  ]
+};
+var figlet = (s) => {
+  const r = [
+    "",
+    "",
+    "",
+    "",
+    ""
+  ];
+  for (const ch of s) for (let k = 0; k < 5; k++) r[k] += FIG[ch][k];
+  return r;
+};
+var LOGO1 = figlet("ASCII SOLAR SYSTEM");
+var LOGO_A = figlet("ASCII");
+var LOGO_B = figlet("SOLAR SYSTEM");
+var HELP = [
+  [
+    "FLY",
+    "W A S D  forward / back / strafe     R F  up / down"
+  ],
+  [
+    "LOOK",
+    "mouse (click to capture) or arrow keys     Q E  roll"
+  ],
+  [
+    "SPEED",
+    "wheel or Z / X  throttle     Shift  boost     Space  brake"
+  ],
+  [
+    "",
+    "speed scales with distance to the nearest surface"
+  ],
+  [
+    "TARGET",
+    "Tab  navigation list     1-9  planets     0  Sun"
+  ],
+  [
+    "",
+    "G  autopilot to target     C  look at target"
+  ],
+  [
+    "INFO",
+    "I  facts about the target"
+  ],
+  [
+    "TIME",
+    "[ ]  slower / faster     K  pause     T  real time     Y  now"
+  ],
+  [
+    "VIEW",
+    "M  system map     O  orbits     L  labels     V  wide / narrow lens"
+  ],
+  [
+    "",
+    "B  glow     U  character shading     + -  text size     P  fps"
+  ],
+  [
+    "SOUND",
+    "N  on / off"
+  ],
+  [
+    "",
+    "Skim an atmosphere: fly low and fast to feel it push back."
+  ]
+];
+var Hud = class {
+  constructor() {
+    this.toasts = [];
+    this.showHelp = false;
+    this.showFps = false;
+    this.fps = 60;
+    this.title = true;
+    this.nav = null;
+    this.showInfo = false;
+    this.labels = true;
+    this.t = 0;
+  }
+  toast(s) {
+    if (!s) return;
+    this.toasts.push({
+      s,
+      t: 3.2
+    });
+    if (this.toasts.length > 3) this.toasts.shift();
+  }
+  text(g, x, y, s, c, glow = 0) {
+    g.text(x, y, s, c[0], c[1], c[2], glow);
+  }
+  panel(g, x, y, w, h, a = 0.72) {
+    g.shade(x, y, w, h, PANEL[0], PANEL[1], PANEL[2], a);
+  }
+  render(g, sys, ship, view, mode, dt, extra) {
+    this.t += dt;
+    const cols = g.cols, rows = g.rows;
+    if (this.title) {
+      this.drawTitle(g);
+      return;
+    }
+    if (mode === "view") {
+      this.drawMarks(g, ship, view);
+      this.reticle(g);
+    }
+    const rate = TIME_RATES[extra.rateIdx];
+    const tl = ` ${formatDate(sys.jd)} `;
+    const tr = extra.paused ? " || paused " : ` >> ${rate[1]} `;
+    this.panel(g, 0, 0, Math.max(tl.length + tr.length, 26), 2);
+    this.text(g, 0, 0, tl, INK);
+    this.text(g, tl.length, 0, tr, extra.paused ? AMBER : DIM);
+    const thr = ` throttle ${this.throttleBar(ship.speedK)} `;
+    this.text(g, 0, 1, thr, DIM);
+    const reg = ship.region();
+    const l1 = ` ${reg.title} `, l2 = ` ${reg.sub} `;
+    let l3 = "";
+    if (ship.atm && ship.atm.h < ship.atm.body.atmo.top * 1.2) {
+      const P = ship.atm.P;
+      l3 = ` alt ${fmtDist(Math.max(0, ship.atm.h))}  ${P > 0.01 ? P.toFixed(3) + " bar" : P > 1e-5 ? (P * 1e3).toFixed(3) + " mbar" : (P * 1e6).toFixed(2) + " ubar"} `;
+    } else if (ship.altBody && ship.alt < 5e7) l3 = ` ${fmtDist(Math.max(0, ship.alt))} above ${ship.altBody.name} `;
+    const l4 = ` speed ${fmtSpeed(ship.speed)} `;
+    const rw = Math.max(l1.length, l2.length, l3.length, l4.length);
+    this.panel(g, cols - rw, 0, rw, l3 ? 4 : 3);
+    this.text(g, cols - l1.length, 0, l1, AMBER);
+    this.text(g, cols - l2.length, 1, l2, INK);
+    let yy = 2;
+    if (l3) {
+      this.text(g, cols - l3.length, yy++, l3, DIM);
+    }
+    this.text(g, cols - l4.length, yy, l4, ship.heat > 0.15 ? [
+      1,
+      0.55,
+      0.3
+    ] : DIM, ship.heat > 0.15 ? 0.3 : 0);
+    if (ship.heat > 0.12) {
+      const s = ` HULL HEATING ${"#".repeat(Math.round(clamp(ship.heat, 0, 1) * 10)).padEnd(10, ".")} `;
+      this.panel(g, Math.floor((cols - s.length) / 2), 2, s.length, 1, 0.6);
+      const k = 0.7 + 0.3 * Math.sin(this.t * 12);
+      this.text(g, Math.floor((cols - s.length) / 2), 2, s, [
+        1.2 * k,
+        0.5 * k,
+        0.25 * k
+      ], 0.4);
+    }
+    if (ship.auto) {
+      const a = ship.auto;
+      const s = ` AUTOPILOT  ->  ${a.target.name.toUpperCase()}   (any flight key takes over) `;
+      this.panel(g, Math.floor((cols - s.length) / 2), rows - 3, s.length, 1, 0.65);
+      this.text(g, Math.floor((cols - s.length) / 2), rows - 3, s, AMBER, 0.25);
+    }
+    const hint = mode === "map" ? " M back to flight   wheel zoom   Tab targets   G go   H help " : " H help   Tab targets   G go   M map   I info   [ ] time ";
+    this.panel(g, 0, rows - 1, hint.length, 1, 0.6);
+    this.text(g, 0, rows - 1, hint, DIM);
+    if (extra.audioOn) this.text(g, hint.length + 1, rows - 1, " sound on ", [
+      0.5,
+      0.8,
+      0.6
+    ]);
+    this.targetPanel(g, ship);
+    let ty = 5;
+    for (let i = this.toasts.length - 1; i >= 0; i--) {
+      const t = this.toasts[i];
+      t.t -= dt;
+      if (t.t <= 0) {
+        this.toasts.splice(i, 1);
+        continue;
+      }
+      const a = clamp(t.t / 0.6, 0, 1);
+      const s = `  ${t.s}  `;
+      const x = Math.max(0, Math.floor((cols - s.length) / 2));
+      this.panel(g, x, ty, s.length, 1, 0.75 * a);
+      this.text(g, x, ty, s, [
+        INK[0] * a,
+        INK[1] * a,
+        INK[2] * a
+      ], 0.15 * a);
+      ty += 2;
+    }
+    if (this.showFps) {
+      this.fps += (1 / Math.max(dt, 1e-3) - this.fps) * 0.05;
+      const s = ` ${Math.round(this.fps)} fps  ${cols}x${rows}  sim ${extra.perf.sim.toFixed(1)}ms  draw ${extra.perf.render.toFixed(1)}ms `;
+      this.text(g, cols - s.length, rows - 2, s, GREEN);
+    }
+    if (this.nav) this.drawNav(g, ship);
+    if (this.showInfo && ship.target) this.drawInfo(g, ship);
+    if (this.showHelp) this.drawHelp(g);
+  }
+  throttleBar(k) {
+    const t = clamp((Math.log10(k) + 2) / 3.3, 0, 1);
+    const n = Math.round(t * 12);
+    return "[" + "=".repeat(n) + "-".repeat(12 - n) + "]";
+  }
+  reticle(g) {
+    const cx = Math.floor(g.cols / 2), cy = Math.floor(g.rows / 2);
+    const i = cy * g.cols + cx;
+    if (g.ch[i] === 32 || g.kind[i] === K.DUST) g.glyph(cx, cy, 43, 0.35, 0.4, 0.42);
+  }
+  // Names beside bodies, and the target bracket / off-screen pointer.
+  drawMarks(g, ship, view) {
+    const cols = g.cols, rows = g.rows;
+    const used = new Uint8Array(cols * rows);
+    const tgt = ship.target;
+    const frame = ship.frame;
+    const sysRoot = frame.kind === "moon" ? frame.parentBody : frame;
+    const marks = view.marks.slice().sort((a, b) => (b.b === tgt) - (a.b === tgt) || prio(a.b) - prio(b.b));
+    for (const m2 of marks) {
+      const b = m2.b;
+      if (b === tgt) continue;
+      if (!this.labels || !m2.on) continue;
+      const showMoon = b.kind === "moon" && (b.parentBody === sysRoot || b.parentBody === tgt || b.parentBody === frame);
+      const showBelt = b.belt && (frame.kind === "star" ? Math.hypot(...ship.world) / AU > 1.8 && Math.hypot(...ship.world) / AU < 3.6 : false);
+      if (!(b.kind === "planet" || b.kind === "star" || b.kind === "dwarf" || showMoon || showBelt)) continue;
+      if (b === frame && m2.pr > 6) continue;
+      const xi = Math.floor(m2.x), yi = Math.floor(m2.y);
+      const c = yi * cols + xi;
+      if (g.depth[c] < m2.d * 0.98 && m2.pr < 1) continue;
+      if (m2.pr > rows * 0.4) continue;
+      const s = b.name;
+      const lx = xi + Math.ceil(m2.pr / view.aspect) + 2, ly = yi - (m2.pr > 1.5 ? Math.ceil(m2.pr) + 1 : 0);
+      const x0 = m2.pr > 1.5 ? xi - Math.floor(s.length / 2) : lx;
+      if (!this.free(used, cols, rows, x0, ly, s.length)) continue;
+      this.mark(used, cols, x0, ly, s.length);
+      const col = b.kind === "moon" ? [
+        0.6,
+        0.66,
+        0.7
+      ] : b.kind === "star" ? [
+        1,
+        0.85,
+        0.5
+      ] : [
+        0.78,
+        0.8,
+        0.84
+      ];
+      this.text(g, x0, ly, s, col);
+    }
+    if (!tgt) return;
+    const m = view.marks.find((q) => q.b === tgt);
+    if (!m) return;
+    const dist = m.d;
+    const lbl = ` ${tgt.name}  ${fmtDist(Math.max(0, dist - tgt.Req))} `;
+    if (m.on && m.x > 1 && m.x < cols - 2 && m.y > 0 && m.y < rows - 1) {
+      const xi = Math.floor(m.x), yi = Math.floor(m.y);
+      const hx = Math.max(1, Math.ceil(m.pr / view.aspect) + 1), hy = Math.ceil(m.pr);
+      const pulse = 0.8 + 0.2 * Math.sin(this.t * 4);
+      const c = [
+        CYAN[0] * pulse,
+        CYAN[1] * pulse,
+        CYAN[2] * pulse
+      ];
+      if (m.pr < 1.5) {
+        g.glyph(xi - 2, yi, 91, c[0], c[1], c[2], 0.3);
+        g.glyph(xi + 2, yi, 93, c[0], c[1], c[2], 0.3);
+      } else if (m.pr < rows * 0.45) {
+        const corner = (x, y, ch) => g.glyph(x, y, ch.charCodeAt(0), c[0], c[1], c[2], 0.3);
+        corner(xi - hx, yi - hy, "/");
+        corner(xi + hx, yi - hy, "\\");
+        corner(xi - hx, yi + hy, "\\");
+        corner(xi + hx, yi + hy, "/");
+      }
+      const ly = m.pr < 1.5 ? yi + 1 : Math.min(rows - 4, yi + hy + 1);
+      const lx = clamp(xi - Math.floor(lbl.length / 2), 0, cols - lbl.length);
+      if (m.pr < rows * 0.45) {
+        this.panel(g, lx, ly, lbl.length, 1, 0.5);
+        this.text(g, lx, ly, lbl, CYAN);
+      }
+    } else {
+      const cam = ship;
+      const r = m.rel;
+      const cx = r[0] * cam.right[0] + r[1] * cam.right[1] + r[2] * cam.right[2];
+      const cy = r[0] * cam.up[0] + r[1] * cam.up[1] + r[2] * cam.up[2];
+      const a = Math.atan2(cy, cx * view.aspect);
+      const ex = cols / 2 + Math.cos(a) * (cols / 2 - 3), ey = rows / 2 - Math.sin(a) * (rows / 2 - 3);
+      const deg = (a / DEG + 360) % 360;
+      const arrow = deg < 22.5 || deg >= 337.5 ? ">" : deg < 67.5 ? "/" : deg < 112.5 ? "^" : deg < 157.5 ? "\\" : deg < 202.5 ? "<" : deg < 247.5 ? "/" : deg < 292.5 ? "v" : "\\";
+      const x = Math.floor(ex), y = Math.floor(ey);
+      g.glyph(x, y, arrow.charCodeAt(0), CYAN[0] * 1.2, CYAN[1] * 1.2, CYAN[2] * 1.2, 0.5);
+      const lx = clamp(x - Math.floor(lbl.length / 2), 0, cols - lbl.length), ly = clamp(y + (ey > rows / 2 ? -1 : 1), 3, rows - 4);
+      this.panel(g, lx, ly, lbl.length, 1, 0.5);
+      this.text(g, lx, ly, lbl, CYAN);
+    }
+  }
+  free(used, cols, rows, x, y, n) {
+    if (y < 2 || y >= rows - 2 || x < 0 || x + n >= cols) return false;
+    for (let k = -1; k <= n; k++) if (used[y * cols + x + k]) return false;
+    return true;
+  }
+  mark(used, cols, x, y, n) {
+    for (let k = -1; k <= n; k++) used[y * cols + x + k] = 1;
+  }
+  targetPanel(g, ship) {
+    const t = ship.target;
+    if (!t) return;
+    const cols = g.cols, rows = g.rows;
+    const w = ship.world;
+    const d = Math.hypot(t.pos[0] - w[0], t.pos[1] - w[1], t.pos[2] - w[2]);
+    const alt = Math.max(0, d - t.Req);
+    const u = [
+      (t.pos[0] - w[0]) / d,
+      (t.pos[1] - w[1]) / d,
+      (t.pos[2] - w[2]) / d
+    ];
+    const close = ship.vel[0] * u[0] + ship.vel[1] * u[1] + ship.vel[2] * u[2];
+    const eta = close > 0.01 ? alt / close : Infinity;
+    const lines = [
+      [
+        ` TARGET  ${t.name.toUpperCase()}`,
+        AMBER
+      ],
+      [
+        ` ${t.info ? t.info.type : t.kind}`,
+        DIM
+      ],
+      [
+        ` range ${fmtDist(alt)}${d > 1e7 ? `  (light ${fmtDuration(d / C_KMS)})` : ""}`,
+        INK
+      ],
+      [
+        ` ${close > 0.01 ? `closing ${fmtSpeed(close)}  eta ${fmtDuration(eta)}` : "not closing"}`,
+        DIM
+      ],
+      [
+        ship.auto ? " autopilot engaged" : " G go   C look   I info",
+        ship.auto ? AMBER : DIM
+      ]
+    ];
+    const pw = Math.max(...lines.map((l) => l[0].length)) + 2;
+    const x0 = cols - pw, y0 = rows - lines.length - 1;
+    this.panel(g, x0, y0, pw, lines.length);
+    lines.forEach(([s, c], k) => this.text(g, x0, y0 + k, s, c));
+  }
+  // ---- navigation list ------------------------------------------------------------------------------
+  openNav(sys, ship) {
+    const items = [];
+    const depth = (b) => {
+      let d = 0;
+      for (let p = b.parentBody; p && p.id !== "sun"; p = p.parentBody) d++;
+      return d;
+    };
+    let beltDone = false;
+    for (const b of sys.bodies) {
+      if (b.belt && !beltDone) {
+        items.push({
+          header: "asteroid belt"
+        });
+        beltDone = true;
+      }
+      if (!b.belt && beltDone && b.kind === "planet" && !items.some((i) => i.header === "outer planets")) items.push({
+        header: "outer planets"
+      });
+      if (b.id === "pluto") items.push({
+        header: "kuiper belt"
+      });
+      items.push({
+        b,
+        depth: b.id === "sun" ? 0 : depth(b) + 1
+      });
+    }
+    let sel = items.findIndex((i) => i.b && i.b === (ship.target || ship.frame));
+    if (sel < 0) sel = 1;
+    this.nav = {
+      items,
+      sel
+    };
+  }
+  navMove(d) {
+    const n = this.nav;
+    if (!n) return;
+    let s = n.sel;
+    do {
+      s = (s + d + n.items.length) % n.items.length;
+    } while (!n.items[s].b);
+    n.sel = s;
+  }
+  navSelected() {
+    return this.nav && this.nav.items[this.nav.sel].b;
+  }
+  drawNav(g, ship) {
+    const n = this.nav, rows = g.rows;
+    const w = 42, h = Math.min(n.items.length + 4, rows - 6);
+    const x0 = 2, y0 = 3;
+    this.panel(g, x0, y0, w, h, 0.9);
+    this.text(g, x0 + 2, y0, "NAVIGATION", AMBER, 0.3);
+    this.text(g, x0 + w - 18, y0, "Enter go  Esc", DIM);
+    const vis = h - 3;
+    const top = clamp(n.sel - Math.floor(vis / 2), 0, Math.max(0, n.items.length - vis));
+    const w0 = ship.world;
+    for (let k = 0; k < vis && top + k < n.items.length; k++) {
+      const it = n.items[top + k], y = y0 + 2 + k;
+      if (it.header) {
+        this.text(g, x0 + 2, y, `-- ${it.header} --`, [
+          0.45,
+          0.45,
+          0.48
+        ]);
+        continue;
+      }
+      const b = it.b, selected = top + k === n.sel;
+      const d = Math.hypot(b.pos[0] - w0[0], b.pos[1] - w0[1], b.pos[2] - w0[2]);
+      const name = " ".repeat(it.depth * 2) + b.name;
+      const dist = fmtDist(d);
+      const line = `${selected ? ">" : " "} ${name.padEnd(20)} ${dist.padStart(16)}`;
+      if (selected) g.shade(x0 + 1, y, w - 2, 1, 0.18, 0.12, 0.04, 0.8);
+      this.text(g, x0 + 1, y, line.slice(0, w - 2), selected ? AMBER : b.kind === "moon" ? [
+        0.62,
+        0.66,
+        0.7
+      ] : INK, selected ? 0.25 : 0);
+      if (b === ship.target && !selected) this.text(g, x0 + 1, y, "*", CYAN);
+    }
+  }
+  // ---- body information -------------------------------------------------------------------------------
+  drawInfo(g, ship) {
+    const t = ship.target, inf = t.info || {};
+    const rows = [];
+    rows.push([
+      t.name.toUpperCase(),
+      AMBER
+    ]);
+    rows.push([
+      inf.type || "",
+      DIM
+    ]);
+    rows.push([
+      "",
+      INK
+    ]);
+    const kv = [
+      [
+        "diameter",
+        inf.diameter
+      ],
+      [
+        "mass",
+        inf.mass
+      ],
+      [
+        "gravity",
+        inf.gravity
+      ],
+      [
+        "day",
+        inf.day
+      ],
+      [
+        "year",
+        inf.year
+      ],
+      [
+        "temperature",
+        inf.temp
+      ],
+      [
+        "atmosphere",
+        inf.atmo
+      ],
+      [
+        "moons",
+        inf.moons
+      ]
+    ];
+    for (const [k, v] of kv) if (v) rows.push([
+      `${k.padEnd(12)}${v}`,
+      INK
+    ]);
+    const sunD = t.sunDist / AU;
+    if (t.kind !== "star") {
+      const vs = Math.hypot(...t.vel);
+      rows.push([
+        `${"from Sun".padEnd(12)}${sunD.toFixed(3)} AU now`,
+        INK
+      ]);
+      if (vs > 0 && isFinite(vs)) rows.push([
+        `${"speed".padEnd(12)}${vs.toFixed(1)} km/s ${t.parentBody && t.parentBody.id !== "sun" ? "around the Sun" : "in its orbit"}`,
+        INK
+      ]);
+    }
+    rows.push([
+      "",
+      INK
+    ]);
+    for (const f of inf.facts || []) for (const l of wrap(f, 58)) rows.push([
+      l,
+      [
+        0.75,
+        0.82,
+        0.88
+      ]
+    ]);
+    const w = Math.min(g.cols - 4, Math.max(...rows.map((r) => r[0].length)) + 6), h = rows.length + 3;
+    const x0 = g.cols - w - 2, y0 = Math.max(4, Math.floor((g.rows - h) / 2) - 2);
+    this.panel(g, x0, y0, w, h, 0.9);
+    rows.forEach(([s, c], k) => this.text(g, x0 + 3, y0 + 1 + k, s.slice(0, w - 4), c, k === 0 ? 0.3 : 0));
+    this.text(g, x0 + 3, y0 + h - 1, "I closes", DIM);
+  }
+  drawHelp(g) {
+    const cols = g.cols, rows = g.rows;
+    const w = Math.max(...HELP.map((s) => s[1].length)) + 18, h = HELP.length + 6;
+    const x0 = Math.floor((cols - w) / 2), y0 = Math.max(0, Math.floor((rows - h) / 2));
+    this.panel(g, x0, y0, w, h, 0.9);
+    const top = "+" + "-".repeat(w - 2) + "+";
+    this.text(g, x0, y0, top, AMBER);
+    this.text(g, x0, y0 + h - 1, top, AMBER);
+    for (let y = 1; y < h - 1; y++) {
+      this.text(g, x0, y0 + y, "|", AMBER);
+      this.text(g, x0 + w - 1, y0 + y, "|", AMBER);
+    }
+    this.text(g, x0 + 3, y0 + 1, "FLIGHT MANUAL", AMBER, 0.3);
+    HELP.forEach(([a, b], k) => {
+      this.text(g, x0 + 3, y0 + 3 + k, a, AMBER);
+      this.text(g, x0 + 13, y0 + 3 + k, b, INK);
+    });
+    this.text(g, x0 + 3, y0 + h - 2, "H or Esc closes this", DIM);
+  }
+  drawTitle(g) {
+    const cols = g.cols, rows = g.rows;
+    const t = this.t;
+    const one = LOGO1[0].length + 4 <= cols;
+    const logos = one ? [
+      LOGO1
+    ] : LOGO_B[0].length + 4 <= cols ? [
+      LOGO_A,
+      LOGO_B
+    ] : null;
+    let y0 = Math.max(1, Math.floor(rows * 0.18));
+    const boxH = logos ? logos.length * 6 + 7 : 6;
+    const boxW = logos ? Math.max(...logos.map((l) => l[0].length)) + 8 : 40;
+    g.shade(Math.floor((cols - boxW) / 2), y0 - 2, boxW, boxH, PANEL[0], PANEL[1], PANEL[2], 0.7);
+    if (!logos) {
+      const s = "ASCII SOLAR SYSTEM";
+      this.text(g, Math.floor((cols - s.length) / 2), y0, s, AMBER, 1);
+      y0 += 2;
+    } else {
+      for (const L of logos) {
+        const w = L[0].length, x0 = Math.floor((cols - w) / 2);
+        for (let r = 0; r < 5; r++) for (let k = 0; k < w; k++) {
+          const ch = L[r][k];
+          if (ch === " ") continue;
+          const q = k / w;
+          const wave = 0.85 + 0.15 * Math.sin(t * 2 - k * 0.1 + r * 0.4);
+          g.glyph(x0 + k, y0 + r, ch.charCodeAt(0), (1 - q * 0.45) * 1.5 * wave, (0.6 + q * 0.15) * 1.5 * wave, (0.25 + q * 0.75) * 1.5 * wave, 0.7);
+        }
+        y0 += 6;
+      }
+    }
+    const sub2 = "fly through the real Solar System, drawn in 95 printable characters";
+    this.text(g, Math.floor((cols - sub2.length) / 2), y0 + 1, sub2, INK);
+    const go = "[ click or press any key to launch ]";
+    const blink = 0.75 + 0.25 * Math.sin(t * 3);
+    this.text(g, Math.floor((cols - go.length) / 2), y0 + 3, go, [
+      AMBER[0] * blink,
+      AMBER[1] * blink,
+      AMBER[2] * blink
+    ], 0.4 * blink);
+    const hint = "WASD fly  /  mouse look  /  Tab targets  /  G autopilot  /  H help";
+    this.text(g, Math.floor((cols - hint.length) / 2), y0 + 4, hint, DIM);
+  }
+};
+function prio(b) {
+  return b.kind === "star" ? 0 : b.kind === "planet" ? 1 : b.kind === "dwarf" ? 2 : b.kind === "asteroid" ? 3 : 4;
+}
+function wrap(s, n) {
+  const out = [];
+  let line = "";
+  for (const w of s.split(" ")) {
+    if ((line + " " + w).trim().length > n) {
+      out.push(line.trim());
+      line = w;
+    } else line += " " + w;
+  }
+  if (line.trim()) out.push(line.trim());
+  return out;
+}
+
+// src/audio.js
+var SpaceAudio = class {
+  constructor() {
+    this.ctx = null;
+    this.on = false;
+  }
+  async start() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    this.ctx = ctx;
+    const master = ctx.createGain();
+    master.gain.value = 0.5;
+    master.connect(ctx.destination);
+    this.master = master;
+    const noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noise.getChannelData(0);
+    let b = 0;
+    for (let i = 0; i < d.length; i++) {
+      b = 0.985 * b + 0.015 * (Math.random() * 2 - 1);
+      d[i] = b * 6;
+    }
+    const loop = (gain) => {
+      const s = ctx.createBufferSource();
+      s.buffer = noise;
+      s.loop = true;
+      s.connect(gain);
+      s.start();
+      return s;
+    };
+    const drone = ctx.createGain();
+    drone.gain.value = 0.08;
+    drone.connect(master);
+    for (const f of [
+      41.2,
+      61.7,
+      82.6
+    ]) {
+      const o = ctx.createOscillator();
+      o.type = "sine";
+      o.frequency.value = f;
+      const g = ctx.createGain();
+      g.gain.value = f < 50 ? 0.6 : 0.25;
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = 0.05 + f * 7e-4;
+      const lg = ctx.createGain();
+      lg.gain.value = 0.2;
+      lfo.connect(lg);
+      lg.connect(g.gain);
+      lfo.start();
+      o.connect(g);
+      g.connect(drone);
+      o.start();
+    }
+    this.drive = ctx.createGain();
+    this.drive.gain.value = 0;
+    this.drive.connect(master);
+    this.driveF = ctx.createBiquadFilter();
+    this.driveF.type = "bandpass";
+    this.driveF.frequency.value = 300;
+    this.driveF.Q.value = 0.8;
+    this.driveF.connect(this.drive);
+    const dn = ctx.createGain();
+    dn.gain.value = 0.5;
+    dn.connect(this.driveF);
+    loop(dn);
+    this.saw = ctx.createOscillator();
+    this.saw.type = "sawtooth";
+    this.saw.frequency.value = 50;
+    const sg = ctx.createGain();
+    sg.gain.value = 0.05;
+    this.saw.connect(sg);
+    sg.connect(this.driveF);
+    this.saw.start();
+    this.roar = ctx.createGain();
+    this.roar.gain.value = 0;
+    this.roar.connect(master);
+    this.roarF = ctx.createBiquadFilter();
+    this.roarF.type = "lowpass";
+    this.roarF.frequency.value = 400;
+    this.roarF.connect(this.roar);
+    const rn = ctx.createGain();
+    rn.gain.value = 1;
+    rn.connect(this.roarF);
+    loop(rn);
+    await ctx.resume();
+    this.on = true;
+  }
+  async toggle() {
+    if (!this.ctx) {
+      await this.start();
+      return;
+    }
+    if (this.on) {
+      await this.ctx.suspend();
+      this.on = false;
+    } else {
+      await this.ctx.resume();
+      this.on = true;
+    }
+  }
+  blip(f = 880, dur = 0.06, vol = 0.12) {
+    if (!this.on) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "triangle";
+    o.frequency.setValueAtTime(f, t);
+    o.frequency.exponentialRampToValueAtTime(f * 1.5, t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(1e-4, t + dur * 2.5);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + dur * 3);
+  }
+  swell(up = true) {
+    if (!this.on) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(up ? 110 : 440, t);
+    o.frequency.exponentialRampToValueAtTime(up ? 440 : 165, t + 1.6);
+    g.gain.setValueAtTime(1e-4, t);
+    g.gain.exponentialRampToValueAtTime(0.12, t + 0.4);
+    g.gain.exponentialRampToValueAtTime(1e-4, t + 2.2);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + 2.3);
+  }
+  update(ship) {
+    if (!this.on || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    const sp = ship.speed;
+    const lv = Math.min(1, Math.max(0, (Math.log10(sp + 1e-3) + 1) / 9));
+    const moving = ship.auto || sp > 0.01 ? 1 : 0;
+    this.drive.gain.setTargetAtTime(0.05 + 0.12 * lv * moving, t, 0.3);
+    this.driveF.frequency.setTargetAtTime(160 + 900 * lv, t, 0.3);
+    this.saw.frequency.setTargetAtTime(38 + 60 * lv, t, 0.3);
+    const h = Math.min(1, ship.heat);
+    this.roar.gain.setTargetAtTime(0.5 * h + 0.06 * ship.streak, t, 0.15);
+    this.roarF.frequency.setTargetAtTime(250 + 1800 * h, t, 0.2);
+  }
+};
+
+// src/asciify.js
+var RAMPS = [];
+RAMPS[K.ROCK] = " .:-=+*#%@";
+RAMPS[K.ICE] = " .:;=+*#%";
+RAMPS[K.GAS] = " .-~=+#";
+RAMPS[K.OCEAN] = " .~~";
+RAMPS[K.CLOUD] = " .:;+*#%";
+RAMPS[K.LAND] = " .,:;+*#";
+RAMPS[K.RING] = " .:-=";
+RAMPS[K.DUST] = " ...:";
+var GAIN = [];
+GAIN[K.ROCK] = 1;
+GAIN[K.ICE] = 0.95;
+GAIN[K.GAS] = 1;
+GAIN[K.OCEAN] = 1.4;
+GAIN[K.CLOUD] = 0.95;
+GAIN[K.LAND] = 1.08;
+GAIN[K.RING] = 1.1;
+GAIN[K.DUST] = 1.7;
+var codes = [];
+for (let k = 0; k < 16; k++) codes[k] = RAMPS[k] ? [
+  ...RAMPS[k]
+].map((c) => c.charCodeAt(0)) : null;
+function asciify(g, strength = 1) {
+  const { cols, rows, ch, fg, bg, kind, glow } = g;
+  const n = cols * rows;
+  for (let i = 0; i < n; i++) {
+    if (ch[i] !== 32) continue;
+    const k = kind[i];
+    const ramp = codes[k];
+    if (!ramp || glow[i] > 0.12) continue;
+    const k3 = i * 3;
+    const r = bg[k3], gg = bg[k3 + 1], b = bg[k3 + 2];
+    const L = 0.299 * r + 0.587 * gg + 0.114 * b;
+    const m = ramp.length;
+    const t = Math.sqrt(L) * GAIN[k] * strength;
+    let idx = Math.floor(t * m);
+    if (idx <= 0) continue;
+    if (idx >= m) idx = m - 1;
+    ch[i] = ramp[idx];
+    fg[k3] = r * 1.85 + 0.012;
+    fg[k3 + 1] = gg * 1.85 + 0.012;
+    fg[k3 + 2] = b * 1.85 + 0.015;
+    bg[k3] = r * 0.6;
+    bg[k3 + 1] = gg * 0.6;
+    bg[k3 + 2] = b * 0.6;
+  }
+}
+
+// src/main.js
+var WEIGHT = 600;
+var PLANET_KEYS = ["sun", "mercury", "venus", "earth", "mars", "jupiter", "saturn", "uranus", "neptune", "pluto"];
+var LENSES = [[62, "normal lens"], [22, "telephoto lens"], [100, "wide lens"]];
+async function main() {
+  const canvas = document.getElementById("screen");
+  let gl;
+  try {
+    gl = new GLRenderer(canvas);
+  } catch (e) {
+    document.getElementById("fallback").hidden = false;
+    document.getElementById("fallback-msg").textContent = String(e.message || e);
+    return;
+  }
+  await waitForFont(WEIGHT);
+  const grid = new Grid();
+  const sys = new SolarSystem(jdFromMs(Date.now()));
+  const stars = new StarField();
+  const baker = new Baker();
+  const view = new View(stars, baker);
+  const map = new MapView();
+  const ship = new Ship(sys);
+  const hud = new Hud();
+  const audio = new SpaceAudio();
+  const state = { mode: "view", glyphs: true, bloom: true, orbits: false, rateIdx: 4, paused: false, lens: 0, font: null, layout: null, gain: 1 };
+  let userScale = 1;
+  try {
+    userScale = parseFloat(localStorage.getItem("asciisolar.scale")) || 1;
+  } catch {
+  }
+  const layout = () => {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const W = Math.floor(window.innerWidth * dpr), H = Math.floor(window.innerHeight * dpr);
+    canvas.width = W;
+    canvas.height = H;
+    const base = clamp(Math.round(window.innerHeight / 60), 9, 18);
+    const px = clamp(Math.round(base * userScale), 6, 30);
+    const font = buildFont(px, dpr, WEIGHT);
+    gl.setAtlas(font);
+    const cols = Math.max(20, Math.floor(W / font.cellW)), rows = Math.max(10, Math.floor(H / font.cellH));
+    grid.resize(cols, rows);
+    state.font = font;
+    state.layout = { ox: Math.floor((W - cols * font.cellW) / 2), oy: Math.floor((H - rows * font.cellH) / 2) };
+  };
+  layout();
+  let resizeT = 0;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeT);
+    resizeT = setTimeout(layout, 120);
+  });
+  const saturn2 = sys.byId.saturn;
+  baker.now(saturn2);
+  let cineT = 0;
+  const cinematic = (dt) => {
+    cineT += dt;
+    const z = saturn2.axes[2], s = saturn2.toSun;
+    const e1 = norm(cross(z, s)), e2 = norm(cross(e1, z));
+    const a = cineT * 0.035 + 0.6;
+    const flat = add(mul(e2, Math.cos(a)), mul(e1, Math.sin(a)));
+    const dir = norm(add(mul(flat, Math.cos(17 * DEG)), mul(z, Math.sin(17 * DEG) * Math.sign(z[0] * s[0] + z[1] * s[1] + z[2] * s[2] || 1))));
+    ship.frame = saturn2;
+    ship.rel = mul(dir, 3e5);
+    ship.vel = [0, 0, 0];
+    ship.lookAt(saturn2.pos, true);
+    ship.up = norm(add(z, mul(ship.fwd, -(z[0] * ship.fwd[0] + z[1] * ship.fwd[1] + z[2] * ship.fwd[2]))));
+    ship.orthonormalize();
+    ship.fwd = norm(rotate(ship.fwd, ship.right, 13 * DEG));
+    ship.orthonormalize();
+    ship.updateWorld();
+  };
+  const keys = /* @__PURE__ */ new Set();
+  const input = { fwd: 0, right: 0, up: 0, roll: 0, yaw: 0, pitch: 0, boost: false, brake: false, mouseX: 0, mouseY: 0 };
+  let dragging = false, lastMX = 0, lastMY = 0;
+  const setTarget = (b, quiet) => {
+    if (!b) return;
+    ship.target = b;
+    if (!quiet) hud.toast(`Target: ${b.name}  (G to fly there, I for facts)`);
+    audio.blip(660);
+  };
+  const go = () => {
+    if (!ship.target) {
+      hud.toast("Pick a target first: Tab, or 1-9 for the planets");
+      return;
+    }
+    ship.travelTo(ship.target);
+    hud.toast(`Autopilot: heading for ${ship.target.name}`);
+    audio.swell(true);
+  };
+  const startPlaying = () => {
+    if (!hud.title) return false;
+    hud.title = false;
+    sys.update(jdFromMs(Date.now()));
+    state.rateIdx = 2;
+    const earth = sys.byId.earth;
+    baker.now(earth);
+    ship.placeAt(earth, 3e4, 0.9, 0.22);
+    ship.target = sys.byId.moon;
+    audio.start().then(() => hud.toast(audio.on ? "Sound on  (N to mute)" : "")).catch(() => {
+    });
+    hud.toast("Above Earth. Tab picks a destination, G flies you there. H for help.");
+    return true;
+  };
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key;
+    if (hud.title && k !== "F5" && k !== "F11" && k !== "F12") {
+      startPlaying();
+      e.preventDefault();
+      return;
+    }
+    if (k === "Tab" || k === " " || k.startsWith("Arrow") || k === "PageUp" || k === "PageDown") e.preventDefault();
+    if (hud.nav) {
+      if (k === "ArrowUp" || k === "w" || k === "W") {
+        hud.navMove(-1);
+        audio.blip(520, 0.03, 0.05);
+      } else if (k === "ArrowDown" || k === "s" || k === "S") {
+        hud.navMove(1);
+        audio.blip(520, 0.03, 0.05);
+      } else if (k === "PageUp") for (let i = 0; i < 8; i++) hud.navMove(-1);
+      else if (k === "PageDown") for (let i = 0; i < 8; i++) hud.navMove(1);
+      else if (k === "Enter" || k === "g" || k === "G") {
+        setTarget(hud.navSelected(), true);
+        hud.nav = null;
+        go();
+      } else if (k === " ") {
+        setTarget(hud.navSelected());
+        hud.nav = null;
+      } else if (k === "Escape" || k === "Tab") hud.nav = null;
+      return;
+    }
+    keys.add(e.code);
+    if (k === "Tab") hud.openNav(sys, ship);
+    else if (k === "h" || k === "H" || k === "?") hud.showHelp = !hud.showHelp;
+    else if (k === "Escape") {
+      hud.showHelp = false;
+      hud.showInfo = false;
+    } else if (k === "m" || k === "M") {
+      state.mode = state.mode === "view" ? "map" : "view";
+      if (state.mode === "map" && document.pointerLockElement) document.exitPointerLock();
+      hud.toast(state.mode === "map" ? "System map  (M to return)" : "Flight view");
+    } else if (k === "g" || k === "G") go();
+    else if (k === "c" || k === "C") {
+      if (ship.target) {
+        ship.look = { p: ship.target, t: 0 };
+      }
+    } else if (k === "i" || k === "I") hud.showInfo = !hud.showInfo;
+    else if (k === "o" || k === "O") {
+      state.orbits = !state.orbits;
+      hud.toast(state.orbits ? "Orbits shown" : "Orbits hidden");
+    } else if (k === "l" || k === "L") {
+      hud.labels = !hud.labels;
+      hud.toast(hud.labels ? "Labels on" : "Labels off");
+    } else if (k === "v" || k === "V") {
+      state.lens = (state.lens + 1) % LENSES.length;
+      ship.fov = LENSES[state.lens][0] * DEG;
+      hud.toast(LENSES[state.lens][1]);
+    } else if (k === "b" || k === "B") {
+      state.bloom = !state.bloom;
+      hud.toast(state.bloom ? "Glow on" : "Glow off");
+    } else if (k === "u" || k === "U") {
+      state.glyphs = !state.glyphs;
+      hud.toast(state.glyphs ? "Character shading on" : "Character shading off (flat colour)");
+    } else if (k === "p" || k === "P") hud.showFps = !hud.showFps;
+    else if (k === "n" || k === "N") audio.toggle().then(() => hud.toast(audio.on ? "Sound on" : "Sound off"));
+    else if (k === "k" || k === "K") {
+      state.paused = !state.paused;
+      hud.toast(state.paused ? "Clock paused" : "Clock running");
+    } else if (k === "]" || k === "[") {
+      state.paused = false;
+      state.rateIdx = clamp(state.rateIdx + (k === "]" ? 1 : -1), 0, TIME_RATES.length - 1);
+      hud.toast(`Time: ${TIME_RATES[state.rateIdx][1]}`);
+    } else if (k === "t" || k === "T") {
+      state.rateIdx = 0;
+      state.paused = false;
+      hud.toast("Time: real time");
+    } else if (k === "y" || k === "Y") {
+      sys.update(jdFromMs(Date.now()));
+      hud.toast(`Back to now: ${formatDate(sys.jd)}`);
+    } else if (k >= "0" && k <= "9") setTarget(sys.byId[PLANET_KEYS[+k]]);
+    else if (k === "+" || k === "=" || k === "-" || k === "_") {
+      userScale = clamp(userScale * (k === "-" || k === "_" ? 1 / 1.12 : 1.12), 0.45, 2.2);
+      try {
+        localStorage.setItem("asciisolar.scale", String(userScale));
+      } catch {
+      }
+      layout();
+    } else if (k === "z" || k === "Z") {
+      if (state.mode === "map") map.zoomBy(1.5);
+      else throttle(1);
+    } else if (k === "x" || k === "X") {
+      if (state.mode === "map") map.zoomBy(1 / 1.5);
+      else throttle(-1);
+    }
+  });
+  const throttle = (d) => {
+    ship.speedK = clamp(ship.speedK * (d > 0 ? 1.3 : 1 / 1.3), 0.01, 20);
+  };
+  window.addEventListener("keyup", (e) => keys.delete(e.code));
+  window.addEventListener("blur", () => keys.clear());
+  canvas.addEventListener("mousedown", (e) => {
+    if (startPlaying()) return;
+    dragging = true;
+    lastMX = e.clientX;
+    lastMY = e.clientY;
+    if (state.mode === "view" && !document.pointerLockElement && canvas.requestPointerLock) {
+      try {
+        const r = canvas.requestPointerLock();
+        if (r && r.catch) r.catch(() => {
+        });
+      } catch {
+      }
+    }
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+  });
+  window.addEventListener("mousemove", (e) => {
+    const k = ship.fov / (62 * DEG);
+    if (document.pointerLockElement === canvas) {
+      input.mouseX += e.movementX * 22e-4 * k;
+      input.mouseY += e.movementY * 22e-4 * k;
+    } else if (dragging) {
+      input.mouseX += (e.clientX - lastMX) * 4e-3 * k;
+      input.mouseY += (e.clientY - lastMY) * 4e-3 * k;
+      lastMX = e.clientX;
+      lastMY = e.clientY;
+    }
+  });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (hud.nav) {
+      hud.navMove(e.deltaY > 0 ? 1 : -1);
+      return;
+    }
+    if (state.mode === "map") map.zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    else throttle(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+  let tStart = null;
+  canvas.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    if (startPlaying()) return;
+    const t = e.touches[0];
+    tStart = { x: t.clientX, y: t.clientY, lx: t.clientX, ly: t.clientY, moved: false, time: performance.now() };
+  }, { passive: false });
+  canvas.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    if (!tStart) return;
+    input.mouseX += (t.clientX - tStart.lx) * 5e-3;
+    input.mouseY += (t.clientY - tStart.ly) * 5e-3;
+    tStart.lx = t.clientX;
+    tStart.ly = t.clientY;
+    if (Math.hypot(t.clientX - tStart.x, t.clientY - tStart.y) > 12) tStart.moved = true;
+  }, { passive: false });
+  canvas.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    if (tStart && !tStart.moved && performance.now() - tStart.time < 250) {
+      const y = e.changedTouches[0].clientY;
+      if (y < 80) state.mode = state.mode === "view" ? "map" : "view";
+      else if (y > window.innerHeight - 80) {
+        hud.openNav(sys, ship);
+      }
+    }
+    tStart = null;
+  }, { passive: false });
+  const readInput = () => {
+    const k = (c) => keys.has(c);
+    input.fwd = (k("KeyW") ? 1 : 0) - (k("KeyS") ? 1 : 0);
+    input.right = (k("KeyD") ? 1 : 0) - (k("KeyA") ? 1 : 0);
+    input.up = (k("KeyR") ? 1 : 0) - (k("KeyF") ? 1 : 0);
+    input.roll = (k("KeyE") ? 1 : 0) - (k("KeyQ") ? 1 : 0);
+    input.yaw = (k("ArrowRight") ? 1 : 0) - (k("ArrowLeft") ? 1 : 0);
+    input.pitch = (k("ArrowUp") ? 1 : 0) - (k("ArrowDown") ? 1 : 0);
+    input.boost = k("ShiftLeft") || k("ShiftRight");
+    input.brake = k("Space");
+    if (tStart && !tStart.moved && performance.now() - tStart.time > 300) input.fwd = 1;
+    if (hud.nav || state.mode === "map") {
+      input.fwd = input.right = input.up = 0;
+    }
+  };
+  window.__solar = {
+    sys,
+    ship,
+    hud,
+    view,
+    map,
+    state,
+    baker,
+    audio,
+    start() {
+      startPlaying();
+    },
+    target(id) {
+      setTarget(sys.byId[id], true);
+    },
+    go(id) {
+      setTarget(sys.byId[id], true);
+      go();
+    },
+    // jump straight to a body: distance in km from its centre (default: autopilot standoff)
+    tp(id, dist, side, elev) {
+      const b = sys.byId[id];
+      baker.now(b);
+      ship.placeAt(b, dist || ship.standoff(b), side ?? 0.6, elev ?? 0.25);
+      ship.target = b;
+      ship.auto = null;
+    },
+    look(x, y, z) {
+      ship.lookAt([x, y, z], true);
+    },
+    // view body id from above body-fixed (lat, lon) at dist km from its centre, north up
+    orbit(id, dist, lat, lon, tilt = 0) {
+      const b = sys.byId[id];
+      baker.now(b);
+      const ax = b.axes, la = lat * DEG, lo = lon * DEG;
+      const d = [0, 1, 2].map((k) => ax[0][k] * Math.cos(la) * Math.cos(lo) + ax[1][k] * Math.cos(la) * Math.sin(lo) + ax[2][k] * Math.sin(la));
+      ship.frame = b;
+      ship.rel = mul(d, dist);
+      ship.vel = [0, 0, 0];
+      ship.auto = null;
+      ship.target = b;
+      ship.fwd = mul(d, -1);
+      ship.up = ax[2].slice();
+      ship.orthonormalize();
+      if (tilt) {
+        ship.fwd = norm(rotate(ship.fwd, ship.right, tilt * DEG));
+        ship.orthonormalize();
+      }
+      ship.updateWorld();
+    },
+    lookAt(id) {
+      ship.lookAt(sys.byId[id].pos, true);
+    },
+    turn(yaw, pitch) {
+      input.mouseX += yaw;
+      input.mouseY += pitch;
+    },
+    // sunlit view: dlon degrees from the sub-solar meridian; featLon (optional) spins time until that
+    // body-fixed longitude faces the Sun (featDrift: its own drift in deg/day)
+    sunside(id, dist, lat = 15, dlon = 0, featLon, featDrift = 0) {
+      const b = sys.byId[id];
+      const sub2 = () => {
+        const s = b.toSun, ax = b.axes;
+        return Math.atan2(s[0] * ax[1][0] + s[1] * ax[1][1] + s[2] * ax[1][2], s[0] * ax[0][0] + s[1] * ax[0][1] + s[2] * ax[0][2]) / DEG;
+      };
+      if (featLon !== void 0 && b.rot && b.rot.Wd) {
+        for (let k = 0; k < 6; k++) {
+          const days = sys.jd - 2451545, f = featLon + featDrift * days;
+          const d = (sub2() - f + 540) % 360 - 180;
+          sys.update(sys.jd + d / (b.rot.Wd - featDrift));
+        }
+      }
+      this.orbit(id, dist, lat, sub2() + dlon);
+    },
+    jd(v) {
+      sys.update(v);
+    },
+    rate(i) {
+      state.rateIdx = i;
+    },
+    mode(m) {
+      state.mode = m;
+    },
+    bakeAll() {
+      for (const b of sys.bodies) if (b.kind !== "star") baker.now(b);
+    },
+    perf: { frame: 0, sim: 0, render: 0 }
+  };
+  const autoExposure = (dt) => {
+    const { bg, kind } = grid, n = grid.cols * grid.rows;
+    let sum = 0, cnt = 0;
+    for (let i = 0; i < n; i += 3) {
+      const k = kind[i];
+      if (k === 0 || k === 4) continue;
+      const j = i * 3;
+      sum += 0.299 * bg[j] + 0.587 * bg[j + 1] + 0.114 * bg[j + 2];
+      cnt++;
+    }
+    let want = 1;
+    if (cnt > n / 3 * 0.06) want = clamp(0.2 / Math.max(1e-4, sum / cnt), 0.75, 3.5);
+    state.gain += (want - state.gain) * (1 - Math.exp(-dt * 1.5));
+    const gn = state.gain;
+    if (Math.abs(gn - 1) < 0.01) return;
+    const { fg } = grid;
+    for (let i = 0; i < n; i++) {
+      if (kind[i] === 4 && grid.ch[i] !== 32) {
+      }
+      const j = i * 3;
+      bg[j] *= gn;
+      bg[j + 1] *= gn;
+      bg[j + 2] *= gn;
+      fg[j] *= gn;
+      fg[j + 1] *= gn;
+      fg[j + 2] *= gn;
+    }
+  };
+  let last = performance.now();
+  const frame = (now) => {
+    const dt = Math.min(0.1, Math.max(1e-3, (now - last) / 1e3));
+    last = now;
+    readInput();
+    const t0 = performance.now();
+    const rate = hud.title ? 3600 : state.paused ? 0 : TIME_RATES[state.rateIdx][0];
+    if (rate) sys.update(sys.jd + dt * rate / 86400);
+    if (hud.title) cinematic(dt);
+    else ship.update(dt, input);
+    while (ship.messages.length) hud.toast(ship.messages.shift());
+    input.mouseX = 0;
+    input.mouseY = 0;
+    baker.work(hud.title ? 10 : 5);
+    const t1 = performance.now();
+    if (state.mode === "view" || hud.title) {
+      const sh = Math.min(1, ship.heat) * 6e-3;
+      const cam = { pos: ship.updateWorld(), fwd: ship.fwd, right: ship.right, up: ship.up, fov: ship.fov };
+      if (sh > 0) {
+        const j = (Math.random() - 0.5) * sh, q = (Math.random() - 0.5) * sh;
+        cam.fwd = norm(add(add(ship.fwd, mul(ship.right, j)), mul(ship.up, q)));
+        cam.right = norm(cross(cam.fwd, ship.up));
+        cam.up = cross(cam.right, cam.fwd);
+      }
+      const fx = { heat: ship.heat, streak: ship.streak, vel: ship.vel, streakCol: ship.atm ? ship.atm.body.look.col : [0.85, 0.85, 0.9] };
+      view.render(grid, sys, cam, state.font, { orbits: state.orbits, target: ship.target, frame: ship.frame, fx: hud.title ? null : fx, dt, twinkle: ship.atm && ship.atm.rho > 0.01 ? 0.6 : 0, mwGain: 1 });
+      autoExposure(dt);
+    } else {
+      map.render(grid, sys, ship, state.font, { dt });
+    }
+    if (state.glyphs) asciify(grid);
+    const t2 = performance.now();
+    const p = window.__solar.perf;
+    p.sim = p.sim * 0.95 + (t1 - t0) * 0.05;
+    p.render = p.render * 0.95 + (t2 - t1) * 0.05;
+    p.frame++;
+    hud.render(grid, sys, ship, view, hud.title ? "title" : state.mode, dt, { rateIdx: state.rateIdx, paused: state.paused, audioOn: audio.on, perf: p });
+    gl.draw(grid, state.layout, { bloom: state.bloom ? 0.55 : 0, vignette: 0.3, exposure: 1.6, saturation: 1.38 });
+    audio.update(ship);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+main();

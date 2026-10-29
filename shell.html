@@ -1,0 +1,25 @@
+<title>ASCII Solar System</title>
+<meta name="description" content="Fly through the real Solar System rendered entirely in ASCII characters: planets and moons in their true positions, Jupiter's Great Red Spot, Saturn's hexagon and rings, the asteroid belt, and atmospheres you can skim.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@600&display=swap">
+<style>
+  :root { --bg: #000000; --ink: #eee3cc; --amber: #ffb347; --dim: #8c877f; color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); overflow: hidden; }
+  body { font-family: "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+  #screen { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; outline: none; }
+  #fallback[hidden] { display: none; }
+  #fallback { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; }
+  #fallback p { max-width: 52ch; line-height: 1.6; margin: 0.5em auto; }
+  #fallback strong { color: var(--amber); letter-spacing: 0.08em; }
+  #fallback span { color: var(--dim); }
+</style>
+<canvas id="screen" tabindex="0" aria-label="ASCII Solar System, an interactive flight through the Solar System rendered in text characters"></canvas>
+<div id="fallback" hidden>
+  <div>
+    <p><strong>ASCII SOLAR SYSTEM</strong></p>
+    <p>This needs WebGL2 to draw its characters, and this browser did not provide it.</p>
+    <p>Try a current version of Chrome, Edge, Firefox or Safari, or enable hardware acceleration.</p>
+    <p><span id="fallback-msg"></span></p>
+  </div>
+</div>

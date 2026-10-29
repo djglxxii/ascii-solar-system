@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Development entry: serve this folder (e.g. `python3 -m http.server`) and open /index.html.
+     `node build.mjs` produces dist/ascii-solar-system.html, a single self-contained file. -->
+<script>
+  fetch('shell.html').then((r) => r.text()).then((html) => {
+    document.body.insertAdjacentHTML('afterbegin', html);
+    const s = document.createElement('script'); s.type = 'module'; s.src = 'src/main.js'; document.body.appendChild(s);
+  });
+</script>
+</head>
+<body></body>
+</html>
